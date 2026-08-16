@@ -99,7 +99,10 @@ fun LeadsListScreen(
                             )
                         }
                         Text(
-                            "Leads (${state.leads.size})",
+                            // Counts what the list below actually holds, which is the open leads —
+                            // the same number the "All" chip shows. The raw lead count would read
+                            // one higher than the rows on screen every time a lead was booked.
+                            "Leads (${state.countFor(LeadFilter.All)})",
                             color = Color.White,
                             fontWeight = FontWeight.Bold,
                             fontSize = 18.sp,

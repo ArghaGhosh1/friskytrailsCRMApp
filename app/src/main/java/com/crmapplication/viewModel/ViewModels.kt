@@ -494,18 +494,40 @@ fun shortStatusLabel(status: String): String {
 }
 
 /**
- * Terminal statuses. Work on the lead is finished either way, so it drops out of the default
- * "All" list instead of padding it forever. Still reachable by tapping its own chip, or by
- * searching name/number — see [LeadsUiState.visibleLeads].
+ * Statuses that take a lead off the working list. Either the deal is finished (booked, rejected) or
+ * it isn't work for today (future, not picking up), so it drops out of the default "All" list and
+ * out of the "All" count instead of padding both forever.
+ *
+ * Most stay reachable by tapping their own chip, or by searching name/number — see
+ * [LeadsUiState.visibleLeads]. [BOOKED_STATUS] is the exception: it has no chip at all (see
+ * [LeadsUiState.filters]), so a booked lead is reachable only by search.
  *
  * Matched by name rather than read from config: the endpoint returns bare strings with no
  * "is terminal" metadata, so there is nothing to derive this from. [BOOKED_STATUS] is load-bearing
  * beyond this list (it gates the booking form and the status lock), so it stays a constant.
  */
-private val CLOSED_STATUS_NAMES: List<String> = listOf(BOOKED_STATUS, "Rejected Leads")
+private val CLOSED_STATUS_KEYS: Set<String> = listOf(
+    BOOKED_STATUS,
+    "Rejected Leads",
+    "Future Leads",
+    "Non Responding Leads",
+).mapTo(HashSet(), ::statusKey)
 
-private fun isClosedStatus(status: String): Boolean =
-    CLOSED_STATUS_NAMES.any { it.equals(status.trim(), ignoreCase = true) }
+/**
+ * Comparison key for a status name: the trailing "Leads" dropped, case folded, and punctuation and
+ * spacing removed.
+ *
+ * The names above are compared against strings the admin typed into a server-side config, so the
+ * spelling that arrives is not knowable from here — this makes "Future", "Future Leads",
+ * "Non Responding" and "Non-Responding Leads" all land on the status they were meant to be.
+ */
+private fun statusKey(status: String): String =
+    shortStatusLabel(status).lowercase().filter(Char::isLetterOrDigit)
+
+private fun isClosedStatus(status: String): Boolean = statusKey(status) in CLOSED_STATUS_KEYS
+
+/** True for the booked status under any spelling the config might use — the one chip-less status. */
+private fun isBookedStatus(status: String): Boolean = statusKey(status) == statusKey(BOOKED_STATUS)
 
 data class LeadsUiState(
     val isLoading: Boolean = false,
@@ -621,15 +643,21 @@ data class LeadsUiState(
         else statuses + BOOKED_STATUS
 
     /**
-     * The filter chips: "All" then one per server status, in the server's order.
+     * The filter chips: "All" then one per server status, in the server's order — except
+     * [BOOKED_STATUS], which gets no chip. A booked lead is done being worked, so the list offers no
+     * way to browse them; it's found by searching its name or number instead.
+     *
+     * Booked keeps its place in [statusOptions] regardless — that dropdown entry is the only route to
+     * the booking form.
      *
      * An active filter whose status has since left the config is kept on the end rather than
      * dropped. Dropping it would hide the chip while [visibleLeads] still filtered by it — an
-     * invisible filter the agent has no way to clear.
+     * invisible filter the agent has no way to clear. That fallback also covers Booked: no chip is
+     * offered, but one that somehow became active stays clearable rather than stranding the list.
      */
     val filters: List<LeadFilter>
         get() {
-            val fromConfig = statuses.map(LeadFilter::forStatus)
+            val fromConfig = statuses.filterNot(::isBookedStatus).map(LeadFilter::forStatus)
             val active = activeFilter
             val stale = active != null && active.statusMatch != null &&
                 fromConfig.none { it.statusMatch.equals(active.statusMatch, ignoreCase = true) }

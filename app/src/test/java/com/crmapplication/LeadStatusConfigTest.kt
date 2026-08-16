@@ -92,14 +92,45 @@ class LeadStatusConfigTest {
 
     @Test
     fun `chips are All plus the server statuses in the server's order`() {
-        val state = LeadsUiState(statuses = listOf("Fresh Leads", "Walk In", "Booked"))
+        val state = LeadsUiState(statuses = listOf("Fresh Leads", "Walk In", "Prospect Leads"))
         assertEquals(
-            listOf("All", "Fresh", "Walk In", "Booked"),
+            listOf("All", "Fresh", "Walk In", "Prospect"),
             state.filters.map { it.label },
         )
         assertEquals(
-            listOf(null, "Fresh Leads", "Walk In", "Booked"),
+            listOf(null, "Fresh Leads", "Walk In", "Prospect Leads"),
             state.filters.map { it.statusMatch },
+        )
+    }
+
+    /**
+     * Booked is the one status with no chip: the work is finished, so the list offers no way to browse
+     * them and a search is the only route. It still has to reach the status dropdown, which is what
+     * `statusOptions` covers.
+     */
+    @Test
+    fun `booked gets no chip`() {
+        val state = LeadsUiState(statuses = DEFAULT_LEAD_STATUSES)
+        assertTrue(state.filters.none { it.statusMatch == BOOKED_STATUS })
+        assertEquals(DEFAULT_LEAD_STATUSES.size, state.filters.size) // All, minus Booked
+    }
+
+    /** The config's spelling of the booked status isn't knowable here, so the match can't be exact. */
+    @Test
+    fun `a differently-spelled booked gets no chip either`() {
+        val state = LeadsUiState(statuses = listOf("Fresh Leads", "BOOKED Leads"))
+        assertEquals(listOf("All", "Fresh"), state.filters.map { it.label })
+    }
+
+    /** The other closed statuses keep their chips — only Booked is search-only. */
+    @Test
+    fun `the remaining closed statuses stay browsable by chip`() {
+        val state = LeadsUiState(
+            statuses = listOf("Rejected Leads", "Future Leads", "Non Responding Leads"),
+        )
+        assertEquals(
+            listOf("All", "Rejected", "Future", "Non Responding"),
+            state.filters.map { it.label },
         )
     }
 
@@ -120,7 +151,8 @@ class LeadStatusConfigTest {
         val removed = LeadFilter.forStatus("Retired Leads")
         val state = LeadsUiState(statuses = DEFAULT_LEAD_STATUSES, activeFilter = removed)
         assertEquals(removed, state.filters.last())
-        assertEquals(DEFAULT_LEAD_STATUSES.size + 2, state.filters.size)
+        // All + the config statuses (less Booked, which never gets a chip) + the stale one.
+        assertEquals(DEFAULT_LEAD_STATUSES.size + 1, state.filters.size)
     }
 
     @Test
@@ -130,7 +162,7 @@ class LeadStatusConfigTest {
             activeFilter = LeadFilter.forStatus("Prospect Leads"),
         )
         assertEquals(1, state.filters.count { it.statusMatch == "Prospect Leads" })
-        assertEquals(DEFAULT_LEAD_STATUSES.size + 1, state.filters.size)
+        assertEquals(DEFAULT_LEAD_STATUSES.size, state.filters.size)
     }
 
     /** Server casing can drift; a re-selected chip shouldn't double up because of it. */
@@ -196,24 +228,75 @@ class LeadStatusConfigTest {
 
     @Test
     fun `closed leads stay out of All but return on their own chip`() {
-        val leads = listOf(lead("open", "Fresh Leads"), lead("won", BOOKED_STATUS))
+        val leads = listOf(lead("open", "Fresh Leads"), lead("lost", "Rejected Leads"))
         val base = LeadsUiState(leads = leads, statuses = DEFAULT_LEAD_STATUSES)
 
         assertEquals(listOf("open"), base.visibleLeads.map { it.name })
         assertEquals(
-            listOf("won"),
-            base.copy(activeFilter = LeadFilter.forStatus(BOOKED_STATUS)).visibleLeads.map { it.name },
+            listOf("lost"),
+            base.copy(activeFilter = LeadFilter.forStatus("Rejected Leads")).visibleLeads.map { it.name },
         )
+    }
+
+    /**
+     * The four statuses that take a lead off the working list. All of them leave "All" and its count;
+     * a lead moved to one of them stops showing up in the day's work.
+     */
+    @Test
+    fun `booked rejected future and non responding all drop out of All`() {
+        val state = LeadsUiState(
+            leads = listOf(
+                lead("open", "Fresh Leads"),
+                lead("won", BOOKED_STATUS),
+                lead("lost", "Rejected Leads"),
+                lead("later", "Future Leads"),
+                lead("silent", "Non Responding Leads"),
+            ),
+            statuses = DEFAULT_LEAD_STATUSES + listOf("Future Leads", "Non Responding Leads"),
+        )
+        assertEquals(listOf("open"), state.visibleLeads.map { it.name })
+        assertEquals(1, state.countFor(LeadFilter.All))
+    }
+
+    /** Spelled as the admin might have typed them into the config, without the "Leads" suffix. */
+    @Test
+    fun `the suffixless spellings are recognised as closed too`() {
+        val state = LeadsUiState(
+            leads = listOf(
+                lead("open", "Fresh Leads"),
+                lead("later", "Future"),
+                lead("silent", "Non-Responding"),
+            ),
+            statuses = DEFAULT_LEAD_STATUSES,
+        )
+        assertEquals(listOf("open"), state.visibleLeads.map { it.name })
+        assertEquals(1, state.countFor(LeadFilter.All))
     }
 
     @Test
     fun `a search finds a closed lead regardless of the active chip`() {
         val state = LeadsUiState(
+            leads = listOf(lead("open", "Fresh Leads"), lead("lost", "Rejected Leads")),
+            statuses = DEFAULT_LEAD_STATUSES,
+            searchQuery = "lost",
+        )
+        assertEquals(listOf("lost"), state.visibleLeads.map { it.name })
+    }
+
+    /**
+     * Booked has no chip, so search is the only way back to one — this is the route that has to work.
+     * Searching by number matters as much as by name: an agent who gets a call back from a booked
+     * customer has the number, not the spelling of the name.
+     */
+    @Test
+    fun `a booked lead is reachable by search even with no chip for it`() {
+        val base = LeadsUiState(
             leads = listOf(lead("open", "Fresh Leads"), lead("won", BOOKED_STATUS)),
             statuses = DEFAULT_LEAD_STATUSES,
-            searchQuery = "won",
         )
-        assertEquals(listOf("won"), state.visibleLeads.map { it.name })
+        assertEquals(listOf("open"), base.visibleLeads.map { it.name })
+        assertEquals(listOf("won"), base.copy(searchQuery = "won").visibleLeads.map { it.name })
+        assertTrue(base.copy(searchQuery = "9876543210").visibleLeads.any { it.name == "won" })
     }
 
     /**

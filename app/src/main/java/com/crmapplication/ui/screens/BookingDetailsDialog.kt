@@ -17,6 +17,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -50,8 +51,9 @@ import java.util.TimeZone
  * and the status locks afterwards, so every field is required and validation runs before anything is
  * sent.
  *
- * [products] feeds the Package Name dropdown from the server-owned catalog. If it's empty (catalog
- * never synced), the field falls back to free text rather than trapping the agent behind an empty menu.
+ * [products] supplies suggestions for the Package Name field from the server-owned catalog. The field
+ * takes free text either way — see [PackageNameField] for why it isn't a closed dropdown — so an empty
+ * catalog costs the agent a shortcut, not the ability to book.
  *
  * Field state is local to this Composable, matching `AddLeadScreen`; only "which lead / in flight /
  * done" lives in the ViewModel.
@@ -75,7 +77,11 @@ fun BookingDetailsDialog(
             BookingForm(
                 fullName = lead.name,
                 contactNumber = lead.phone.toIndianMobileDigits(),
-                packageName = lead.product.orEmpty(),
+                // Package name is deliberately NOT pre-filled from `lead.product`. That field records
+                // what the lead enquired about, which is often not what they end up buying, and the
+                // backend overwrites the lead's product from whatever is submitted here. Starting empty
+                // makes the agent state the package actually sold instead of accepting a stale guess —
+                // and it lets the field's hint show. The catalog is still one tap away as a suggestion.
                 adults = lead.numberOfPersons?.takeIf { it > 0 }?.toString().orEmpty(),
                 children = "0",
             )
@@ -228,24 +234,14 @@ fun BookingDetailsDialog(
                     SectionHeader(stringResource(R.string.booking_section_trip))
 
                     FieldPair {
-                        if (products.isEmpty()) {
-                            BookingField(
-                                label = stringResource(R.string.booking_field_package),
-                                value = form.packageName,
-                                onValueChange = { form = form.copy(packageName = it) },
-                                error = errors.packageName,
-                                modifier = Modifier.weight(1f),
-                            )
-                        } else {
-                            BookingDropdown(
-                                label = stringResource(R.string.booking_field_package),
-                                value = form.packageName,
-                                options = products,
-                                onValueChange = { form = form.copy(packageName = it) },
-                                error = errors.packageName,
-                                modifier = Modifier.weight(1f),
-                            )
-                        }
+                        PackageNameField(
+                            value = form.packageName,
+                            suggestions = products,
+                            onValueChange = { form = form.copy(packageName = it) },
+                            error = errors.packageName,
+                            placeholder = stringResource(R.string.booking_package_hint),
+                            modifier = Modifier.weight(1f),
+                        )
                         BookingField(
                             label = stringResource(R.string.booking_field_destination),
                             value = form.location,
@@ -501,53 +497,86 @@ private fun ReadOnlyField(
     }
 }
 
+/**
+ * Package Name — free text with suggestions, deliberately not a closed dropdown.
+ *
+ * The catalog from `GET /api/config` is a starting point rather than the whole world: agents close
+ * deals on packages nobody added to it, and a fixed dropdown left them unable to record the booking
+ * they had actually made. So whatever is typed here is accepted and saved. [suggestions] are a
+ * shortcut for the common case — tapping one fills the field, and the agent can then edit it.
+ *
+ * Matching is by substring, so "lada" finds "Ladakh Package". A suggestion identical to what's
+ * already typed is dropped: there's nothing left to pick once the field says it.
+ *
+ * An empty [suggestions] (catalog never synced) degrades to a plain text field — the menu simply
+ * never has anything to show.
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun BookingDropdown(
-    label: String,
+private fun PackageNameField(
     value: String,
-    options: List<String>,
+    suggestions: List<String>,
     onValueChange: (String) -> Unit,
     error: String?,
+    placeholder: String?,
     modifier: Modifier = Modifier,
 ) {
-    var expanded by remember { mutableStateOf(false) }
+    var focused by remember { mutableStateOf(false) }
+    // Tracked separately from focus so picking a suggestion (or dismissing the list) closes it while
+    // the field keeps focus and the keyboard stays up. Typing clears it, which reopens the list.
+    var dismissed by remember { mutableStateOf(false) }
+
+    val matches = remember(value, suggestions) {
+        val typed = value.trim()
+        if (typed.isEmpty()) suggestions
+        else suggestions.filter {
+            it.contains(typed, ignoreCase = true) && !it.equals(typed, ignoreCase = true)
+        }
+    }
+    val expanded = focused && !dismissed && matches.isNotEmpty()
+
     Column(modifier) {
-        BookingFieldLabel(label)
+        BookingFieldLabel(stringResource(R.string.booking_field_package))
         Spacer(Modifier.height(4.dp))
         ExposedDropdownMenuBox(
             expanded = expanded,
-            onExpandedChange = { expanded = it },
+            // Focus and typing drive the list, so there's nothing to toggle here. A no-op rather than
+            // flipping `expanded`: tapping the field to place the cursor shouldn't close a list of
+            // suggestions the agent is still reading.
+            onExpandedChange = {},
         ) {
             OutlinedTextField(
                 value = value,
-                onValueChange = {},
-                readOnly = true,
-                placeholder = {
-                    Text(
-                        stringResource(R.string.booking_select_hint),
-                        fontSize = 13.sp,
-                        color = CrmOnSurfaceVar,
-                    )
+                onValueChange = {
+                    dismissed = false
+                    onValueChange(it)
                 },
-                trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
                 modifier = Modifier
                     .fillMaxWidth()
-                    .menuAnchor(MenuAnchorType.PrimaryNotEditable),
+                    .menuAnchor(MenuAnchorType.PrimaryEditable)
+                    .onFocusChanged { focusState ->
+                        focused = focusState.isFocused
+                        // Re-arm on the way out, so coming back to the field offers the list again
+                        // instead of staying silently collapsed.
+                        if (!focusState.isFocused) dismissed = false
+                    },
                 singleLine = true,
                 isError = error != null,
+                placeholder = placeholder?.let {
+                    { Text(it, fontSize = 13.sp, color = CrmOnSurfaceVar) }
+                },
                 shape = RoundedCornerShape(10.dp),
                 textStyle = MaterialTheme.typography.bodyMedium,
-                supportingText = error?.let { { Text(it, fontSize = 11.sp) } },
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
                 colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = CrmPrimary),
             )
-            ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-                options.forEach { option ->
+            ExposedDropdownMenu(expanded = expanded, onDismissRequest = { dismissed = true }) {
+                matches.forEach { option ->
                     DropdownMenuItem(
                         text = { Text(option) },
                         onClick = {
                             onValueChange(option)
-                            expanded = false
+                            dismissed = true
                         },
                     )
                 }

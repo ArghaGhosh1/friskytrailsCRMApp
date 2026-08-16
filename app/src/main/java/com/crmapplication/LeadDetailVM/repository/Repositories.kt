@@ -1272,7 +1272,6 @@ class ConfigRepository @Inject constructor(
  * documented default list; the server's copy always wins once fetched.
  */
 val DEFAULT_PRODUCTS: List<String> = listOf(
-    "Meghalaya Package",
     "Hampta Pass Trek",
     "Rishikesh Activities",
     "Spiti Package",

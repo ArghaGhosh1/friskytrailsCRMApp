@@ -60,8 +60,9 @@
     <string name="booking_phone_hint">10 digits, starting 6-9</string>
     <string name="booking_due_hint">Calculated from total minus paid. The server confirms the final figure.</string>
     <string name="booking_payment_mode_hint">HDFC Bank. Fixed for all bookings.</string>
-    <string name="booking_select_hint">Select</string>
+    <string name="booking_package_hint">Type a package name</string>
     <string name="booking_location_hint">Start → End</string>
+
     <string name="booking_date_hint">dd-mm-yyyy</string>
     <string name="booking_screenshot_add">Attach screenshot</string>
     <string name="booking_screenshot_replace">Replace</string>

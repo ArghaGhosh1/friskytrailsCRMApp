@@ -50,7 +50,6 @@ class ProductCatalogTest {
     fun `the offline fallback matches the documented server default`() {
         assertEquals(
             listOf(
-                "Meghalaya Package",
                 "Hampta Pass Trek",
                 "Rishikesh Activities",
                 "Spiti Package",
