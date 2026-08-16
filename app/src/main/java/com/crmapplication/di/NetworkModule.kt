@@ -3,8 +3,10 @@ package com.crmapplication.di
 import com.crmapplication.LeadDetailVM.remote.AgentsApi
 import com.crmapplication.LeadDetailVM.remote.ApiConfig
 import com.crmapplication.LeadDetailVM.remote.AuthApi
+import com.crmapplication.LeadDetailVM.remote.BookingsApi
 import com.crmapplication.LeadDetailVM.remote.BugReportApi
 import com.crmapplication.LeadDetailVM.remote.CallsApi
+import com.crmapplication.LeadDetailVM.remote.CloudinaryApi
 import com.crmapplication.LeadDetailVM.remote.ConfigApi
 import com.crmapplication.LeadDetailVM.remote.LeadsApi
 import com.crmapplication.LeadDetailVM.remote.UploadApi
@@ -27,6 +29,16 @@ import javax.inject.Singleton
 private const val CONNECT_TIMEOUT_SECONDS = 30L
 private const val READ_TIMEOUT_SECONDS = 30L
 private const val WRITE_TIMEOUT_SECONDS = 30L
+
+/**
+ * A 10 MB attachment on mobile data does not finish inside the 30s the API client allows, and the
+ * failure looks identical to a dead network. Uploads get their own budget.
+ */
+private const val UPLOAD_WRITE_TIMEOUT_SECONDS = 180L
+private const val UPLOAD_READ_TIMEOUT_SECONDS = 120L
+
+/** Retrofit demands a base URL even when every call supplies its own via `@Url`. */
+private const val CLOUDINARY_PLACEHOLDER_BASE_URL = "https://api.cloudinary.com/"
 
 /** Extra attempts (beyond the first) for replay-safe requests. */
 private const val MAX_GET_RETRIES = 2
@@ -89,6 +101,51 @@ object NetworkModule {
             .build()
     }
 
+    /**
+     * A separate client for direct-to-Cloudinary uploads, for three reasons — each of which would
+     * break a large upload on the shared one:
+     *
+     * 1. **Logging.** The API client logs at [HttpLoggingInterceptor.Level.BODY] in debug, which
+     *    buffers the entire request body into memory to decide whether it is printable. On a 10 MB
+     *    file that is a second copy of the file plus a real risk of OOM on a low-end device, so this
+     *    client stays at `HEADERS`.
+     * 2. **Timeouts.** See [UPLOAD_WRITE_TIMEOUT_SECONDS].
+     * 3. **Retries.** [RetryIdempotentInterceptor] is GET-only so it would not replay an upload
+     *    anyway, but leaving it off makes that explicit: a retried upload means a duplicate asset.
+     *
+     * Also note what is *absent* — no auth interceptor. The signed form fields authenticate the
+     * upload, and our JWT has no business reaching a third-party host.
+     */
+    @Provides
+    @Singleton
+    @Named("cloudinary")
+    fun provideCloudinaryOkHttpClient(): OkHttpClient {
+        val logging = HttpLoggingInterceptor().apply {
+            level = if (BuildConfig.DEBUG) {
+                HttpLoggingInterceptor.Level.HEADERS
+            } else {
+                HttpLoggingInterceptor.Level.NONE
+            }
+        }
+        return OkHttpClient.Builder()
+            .connectTimeout(CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            .readTimeout(UPLOAD_READ_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            .writeTimeout(UPLOAD_WRITE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            .retryOnConnectionFailure(false)
+            .addInterceptor(logging)
+            .build()
+    }
+
+    @Provides
+    @Singleton
+    fun provideCloudinaryApi(@Named("cloudinary") client: OkHttpClient): CloudinaryApi =
+        Retrofit.Builder()
+            .baseUrl(CLOUDINARY_PLACEHOLDER_BASE_URL)
+            .client(client)
+            .addConverterFactory(GsonConverterFactory.create())
+            .build()
+            .create(CloudinaryApi::class.java)
+
     @Provides
     @Singleton
     @Named("leads")
@@ -133,6 +190,27 @@ object NetworkModule {
     @Singleton
     fun provideBugReportApi(@Named("leads") retrofit: Retrofit): BugReportApi =
         retrofit.create(BugReportApi::class.java)
+
+    /**
+     * Booking creation posts a multipart body with a screenshot in it, so it runs on the
+     * upload-tuned client rather than the shared one: a 5 MB body doesn't reliably finish inside the
+     * API client's 30s write timeout on mobile data, and its `BODY` logging would buffer the whole
+     * image in debug builds.
+     *
+     * Unlike the Cloudinary client this one is pointed at our own host, and auth travels per-call via
+     * `@Header` — see [BookingsApi.createBooking].
+     */
+    @Provides
+    @Singleton
+    fun provideBookingsApi(@Named("cloudinary") client: OkHttpClient): BookingsApi =
+        Retrofit.Builder()
+            // Its own base URL, not the leads one — the booking system is a separate service. See
+            // [ApiConfig.BOOKING_BASE_URL].
+            .baseUrl(ApiConfig.BOOKING_BASE_URL.withTrailingSlash())
+            .client(client)
+            .addConverterFactory(GsonConverterFactory.create())
+            .build()
+            .create(BookingsApi::class.java)
 
     private fun String.withTrailingSlash(): String =
         if (endsWith("/")) this else "$this/"

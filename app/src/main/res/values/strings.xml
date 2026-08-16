@@ -26,7 +26,57 @@
     <string name="lead_field_cancel">Cancel</string>
     <string name="lead_field_clear">Clear</string>
     <string name="lead_field_saved">Saved</string>
+    <string name="lead_details_copied">Lead details copied</string>
     <string name="lead_field_name_required">Name can\'t be empty</string>
     <string name="lead_field_persons_hint">Leave empty to clear</string>
     <string name="lead_field_persons_invalid">Enter a number from 1 to 999</string>
+
+    <!-- Add Booking form (POST api/bookings) -->
+    <string name="booking_title">Add Booking</string>
+    <string name="booking_subtitle">All fields are required. Once booked, this lead\'s status can\'t be changed.</string>
+    <string name="booking_close">Close</string>
+
+    <string name="booking_section_traveller">Traveller Information</string>
+    <string name="booking_section_trip">Trip &amp; Package Details</string>
+    <string name="booking_section_billing">Billing &amp; Transaction Verification</string>
+
+    <string name="booking_field_full_name">Full Name</string>
+    <string name="booking_field_email">Email ID</string>
+    <string name="booking_field_phone">Phone Number</string>
+    <string name="booking_field_emergency_phone">Emergency Contact Number</string>
+    <string name="booking_field_adults">Adults</string>
+    <string name="booking_field_children">Children</string>
+    <string name="booking_field_package">Package Name</string>
+    <string name="booking_field_destination">Start / End Location</string>
+    <string name="booking_field_start_date">Start Date</string>
+    <string name="booking_field_end_date">End Date</string>
+    <string name="booking_field_total_amount">Total Amount (₹)</string>
+    <string name="booking_field_paid_amount">Paid Amount (₹)</string>
+    <string name="booking_field_due_amount">Due Amount (₹)</string>
+    <string name="booking_field_transaction_id">Transaction ID</string>
+    <string name="booking_field_payment_mode">Payment Mode</string>
+    <string name="booking_field_screenshot">Transaction Screenshot</string>
+
+    <string name="booking_phone_hint">10 digits, starting 6-9</string>
+    <string name="booking_due_hint">Calculated from total minus paid. The server confirms the final figure.</string>
+    <string name="booking_payment_mode_hint">HDFC Bank. Fixed for all bookings.</string>
+    <string name="booking_select_hint">Select</string>
+    <string name="booking_location_hint">Start → End</string>
+    <string name="booking_date_hint">dd-mm-yyyy</string>
+    <string name="booking_screenshot_add">Attach screenshot</string>
+    <string name="booking_screenshot_replace">Replace</string>
+    <string name="booking_screenshot_hint">PNG, JPG or PDF, up to %1$d MB</string>
+
+    <string name="booking_submit">Submit Booking</string>
+    <string name="booking_submitting">Submitting…</string>
+    <string name="booking_cancel">Cancel</string>
+
+    <string name="booking_success">Lead booked. Status is now locked.</string>
+    <string name="booking_success_with_id">Booked as %1$s. Status is now locked.</string>
+
+    <!-- Call history + agent-marked voicemail -->
+    <string name="call_history_title">Call history</string>
+    <string name="call_history_voicemail_checkbox">Went to voicemail</string>
+    <string name="call_history_voicemail_badge">Voicemail</string>
+    <string name="call_history_voicemail_hint">Tick any call that went to voicemail — its time is left out of your talk time.</string>
 </resources>

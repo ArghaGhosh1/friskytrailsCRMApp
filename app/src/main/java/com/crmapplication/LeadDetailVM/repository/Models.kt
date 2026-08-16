@@ -1,6 +1,7 @@
 package com.crmapplication.LeadDetailVM.repository
 
 import com.crmapplication.LeadDetailVM.local.BugReportEntity
+import com.crmapplication.LeadDetailVM.local.CallEntity
 import com.crmapplication.LeadDetailVM.local.LeadEntity
 import com.crmapplication.LeadDetailVM.local.NoteEntity
 import com.crmapplication.LeadDetailVM.local.StatusHistoryEntity
@@ -10,9 +11,14 @@ import com.crmapplication.LeadDetailVM.remote.BugReportDto
 import com.crmapplication.LeadDetailVM.remote.BugStatus
 import com.crmapplication.LeadDetailVM.remote.AuthUser
 import com.crmapplication.LeadDetailVM.remote.LeadDto
+import com.crmapplication.LeadDetailVM.remote.LongCallDto
 import com.crmapplication.LeadDetailVM.remote.MeResponse
 import com.crmapplication.LeadDetailVM.remote.NoteDto
+import com.crmapplication.calllog.CallLogEntry
+import com.crmapplication.calllog.CallType
+import com.crmapplication.calllog.normalizedPhoneKey
 import java.time.Instant
+import kotlin.math.abs
 
 data class Lead(
     val id: String,
@@ -107,6 +113,26 @@ data class StatusChange(
     val newStatus: String,
     val changedBy: String,
     val changedAt: Long,
+)
+
+/**
+ * What the server confirmed after a booking was created — the bit worth showing the agent once the
+ * form closes.
+ *
+ * Read back from the response rather than echoed from the form on purpose. The backend owns these
+ * numbers: it derives `dueAmount`, and recalculates `paidAmount` from payments that are already
+ * **verified**. A deposit submitted moments ago is still `VERIFICATION-REQUIRED`, so [paidAmount] of
+ * 0 alongside a non-zero total is the normal, correct result — not a lost payment.
+ *
+ * Every field is nullable because a booking that saved is a success even if the response was thinner
+ * than documented; the UI just falls back to a plain confirmation.
+ */
+data class BookingReceipt(
+    /** The human-readable `FT…` code an agent can quote to the customer. */
+    val bookingId: String? = null,
+    val totalAmount: Long? = null,
+    val paidAmount: Long? = null,
+    val dueAmount: Long? = null,
 )
 
 /**
@@ -217,6 +243,125 @@ private fun String?.toEpochMillisOrNow(): Long =
 private fun String?.toEpochMillisOrNull(): Long? =
     this?.takeIf { it.isNotBlank() }
         ?.let { runCatching { Instant.parse(it).toEpochMilli() }.getOrNull() }
+
+/** Prefix marking a [CallEntity] read from this device's call log. See [CallEntity] for why. */
+const val DEVICE_CALL_ID_PREFIX = "d-"
+
+/** Prefix marking a [CallEntity] backfilled from the calls API. */
+const val SERVER_CALL_ID_PREFIX = "s-"
+
+/**
+ * Persists a device call-log row. [leadId] is null when no assigned lead matched the number yet —
+ * `CallDao.attachLeadId` fills it in once the lead syncs.
+ */
+fun CallLogEntry.toEntity(leadId: String?, isVoicemail: Boolean = false): CallEntity = CallEntity(
+    id = deviceCallId(id),
+    leadId = leadId,
+    phoneKey = number.normalizedPhoneKey(),
+    number = number,
+    type = type.name,
+    dateMillis = dateMillis,
+    durationSeconds = durationSeconds,
+    isFromServer = false,
+    // Passed in, not taken from `this`: the device log has no such concept, so the stored row is the
+    // only copy. Callers must supply the existing mark or the upsert would erase it.
+    isVoicemail = isVoicemail,
+)
+
+/** The `calls.id` for a device call-log row. */
+fun deviceCallId(callLogId: Long): String = "$DEVICE_CALL_ID_PREFIX$callLogId"
+
+/**
+ * Device call-log ids from stored `calls.id` values, dropping any that aren't device rows.
+ *
+ * Lets the Dashboard — which computes from the raw call log rather than the `calls` table — match the
+ * agent's voicemail marks back onto the entries it read.
+ */
+fun deviceCallLogIds(storedIds: List<String>): Set<Long> = storedIds
+    .filter { it.startsWith(DEVICE_CALL_ID_PREFIX) }
+    .mapNotNull { it.removePrefix(DEVICE_CALL_ID_PREFIX).toLongOrNull() }
+    .toSet()
+
+/**
+ * Applies the agent's stored voicemail marks to entries read straight from the device call log.
+ *
+ * The Dashboard computes its stats from the call log rather than the `calls` table, so without this it
+ * would never see a mark and would keep counting a voicemail's duration as talk time. [storedIds] are
+ * raw `calls.id` values from `CallDao.getVoicemailMarkedIds`.
+ */
+fun List<CallLogEntry>.withVoicemailMarks(storedIds: List<String>): List<CallLogEntry> {
+    val marked = deviceCallLogIds(storedIds)
+    if (marked.isEmpty()) return this
+    return map { if (it.id in marked) it.copy(isVoicemail = true) else it }
+}
+
+/**
+ * Back to the domain type the call-log code already speaks, so `callStats`, `bookingFromCalls` and
+ * the history list work on stored rows exactly as they did on freshly-read ones.
+ *
+ * [CallLogEntry.id] is a Long, so it is recovered from the numeric suffix of a device id. A server
+ * row has no numeric id; it gets a negative synthetic one derived from its string id, which keeps it
+ * distinct from every device row (those are positive) and stable across reads — it is only ever used
+ * as a list key, never to address the row.
+ */
+fun CallEntity.toDomain(): CallLogEntry = CallLogEntry(
+    id = id.removePrefix(DEVICE_CALL_ID_PREFIX).toLongOrNull()
+        ?: -(abs(id.hashCode().toLong()) + 1L),
+    number = number,
+    // An unrecognised stored value degrades to UNKNOWN rather than throwing — the reason `type` is
+    // stored as a name instead of an enum ordinal.
+    type = runCatching { CallType.valueOf(type) }.getOrDefault(CallType.UNKNOWN),
+    dateMillis = dateMillis,
+    durationSeconds = durationSeconds,
+    isVoicemail = isVoicemail,
+)
+
+/**
+ * Best-effort direction for a call the backend reported, which stores an outcome (`Connected` |
+ * `Missed` | `Failed` | `Voicemail`) but no direction.
+ *
+ * The inversion is lossy and deliberately biased toward **outgoing**: this app posts an agent's calls
+ * to their assigned leads, which are overwhelmingly dials. Getting it wrong only mislabels the icon on
+ * a backfilled row — `countsAsDial` and `talkTimeSeconds` still land correctly, because an outgoing
+ * call with a duration counts either way and `Voicemail` maps to the type they both exclude.
+ */
+private fun callTypeForServerStatus(status: String?): CallType = when (status?.trim()?.lowercase()) {
+    "connected" -> CallType.OUTGOING
+    "missed" -> CallType.MISSED
+    "failed" -> CallType.OUTGOING
+    "voicemail" -> CallType.VOICEMAIL
+    else -> CallType.UNKNOWN
+}
+
+/**
+ * Maps one row of `GET api/calls/long-calls` into a storable call.
+ *
+ * Null when the row can't be placed on a lead's timeline — no `contactNumber` to match, no digits in
+ * it, or an unparseable `timestamp`. Dropping those is deliberate: a call with no number or no time
+ * can't be shown in history or deduped against a device row.
+ *
+ * [fallbackLeadId] is used when the payload's own `leadId` is absent, which is the common case for the
+ * lead this backfill was requested for.
+ */
+fun LongCallDto.toEntity(fallbackLeadId: String?): CallEntity? {
+    val callNumber = contactNumber?.takeIf { it.isNotBlank() } ?: return null
+    val key = callNumber.normalizedPhoneKey()
+    if (key.isEmpty()) return null
+    val at = timestamp.toEpochMillisOrNull() ?: return null
+    // Falls back to a number+instant key so a payload without `_id` still upserts stably instead of
+    // inserting a fresh duplicate on every backfill.
+    val rowId = id?.takeIf { it.isNotBlank() } ?: "$key-$at"
+    return CallEntity(
+        id = "$SERVER_CALL_ID_PREFIX$rowId",
+        leadId = leadId?.takeIf { it.isNotBlank() } ?: fallbackLeadId,
+        phoneKey = key,
+        number = callNumber,
+        type = callTypeForServerStatus(status).name,
+        dateMillis = at,
+        durationSeconds = duration ?: 0L,
+        isFromServer = true,
+    )
+}
 
 fun NoteDto.toEntity() = NoteEntity(id, leadId, text, timestamp)
 

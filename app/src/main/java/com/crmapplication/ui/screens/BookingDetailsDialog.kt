@@ -1,17 +1,24 @@
 package com.crmapplication.ui.screens
 
+import android.net.Uri
+import android.provider.OpenableColumns
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DateRange
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
@@ -20,12 +27,15 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import com.salescrm.R
 import com.crmapplication.LeadDetailVM.repository.BookingForm
 import com.crmapplication.LeadDetailVM.repository.BookingFormErrors
 import com.crmapplication.LeadDetailVM.repository.Lead
+import com.crmapplication.LeadDetailVM.repository.toIndianMobileDigits
 import com.crmapplication.LeadDetailVM.repository.validate
 import com.crmapplication.ui.theme.CrmOnSurfaceVar
 import com.crmapplication.ui.theme.CrmPrimary
+import com.crmapplication.utils.DocumentPartFactory
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
@@ -33,10 +43,12 @@ import java.util.Locale
 import java.util.TimeZone
 
 /**
- * The Booking Details form, shown when an agent moves a lead to `Booked`.
+ * The Add Booking form, shown when an agent moves a lead to `Booked`.
  *
- * Submitting is the only route to `Booked` — see `LeadsViewModel.updateStatus` — and the status locks
- * afterwards, so every field is required and validation runs before anything is sent.
+ * Laid out in the three sections the booking spec defines — traveller, trip, billing — and submits to
+ * `POST /api/bookings`. Submitting is the only route to `Booked` (see `LeadsViewModel.updateStatus`)
+ * and the status locks afterwards, so every field is required and validation runs before anything is
+ * sent.
  *
  * [products] feeds the Package Name dropdown from the server-owned catalog. If it's empty (catalog
  * never synced), the field falls back to free text rather than trapping the agent behind an empty menu.
@@ -53,15 +65,19 @@ fun BookingDetailsDialog(
     onSubmit: (BookingForm) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    // Pre-filled from the lead the agent already has open. This isn't only convenience: the backend
-    // overwrites the lead's root `name`/`product` from `fullName`/`packageName`, so starting from the
-    // current values means a submit can't silently rename the lead.
+    val context = LocalContext.current
+
+    // Pre-filled from the lead the agent already has open. The phone is normalised to bare digits on
+    // the way in: leads commonly store `+91…`, and the booking API rejects anything that isn't exactly
+    // 10 digits, so passing it through untouched would open the form already invalid.
     var form by remember(lead.id) {
         mutableStateOf(
             BookingForm(
                 fullName = lead.name,
-                contactNumber = lead.phone,
+                contactNumber = lead.phone.toIndianMobileDigits(),
                 packageName = lead.product.orEmpty(),
+                adults = lead.numberOfPersons?.takeIf { it > 0 }?.toString().orEmpty(),
+                children = "0",
             )
         )
     }
@@ -73,25 +89,38 @@ fun BookingDetailsDialog(
         if (submitAttempted) form.validate() else BookingFormErrors()
     }
 
-    // Due = total - paid, until the agent types their own value (a discount breaks the arithmetic, and
-    // their number should win from then on).
-    var dueEdited by remember(lead.id) { mutableStateOf(false) }
-    LaunchedEffect(form.totalAmount, form.paidAmount, dueEdited) {
-        if (dueEdited) return@LaunchedEffect
-        val implied = form.impliedDueAmount?.toString() ?: return@LaunchedEffect
-        if (implied != form.dueAmount) form = form.copy(dueAmount = implied)
-    }
-
     var datePickerTarget by remember { mutableStateOf<BookingDateField?>(null) }
+
+    val screenshotPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        uri?.let {
+            form = form.copy(
+                screenshotUri = it.toString(),
+                screenshotName = context.resolveDisplayName(it),
+            )
+        }
+    }
 
     Dialog(
         onDismissRequest = { if (!isSubmitting) onDismiss() },
-        // A tall form plus the keyboard needs the full width; the default platform width would clip it.
-        properties = DialogProperties(usePlatformDefaultWidth = false),
+        properties = DialogProperties(
+            // A tall form plus the keyboard needs the full width; the default platform width would
+            // clip it.
+            usePlatformDefaultWidth = false,
+            // A dialog gets its own window, and that window ignores IME insets unless told not to fit
+            // system windows. Without this the card keeps its full height behind the keyboard, so the
+            // lower fields — transaction id, payment mode, screenshot — sit under it with no way to
+            // scroll to them.
+            decorFitsSystemWindows = false,
+        ),
     ) {
         Card(
             modifier = Modifier
                 .fillMaxWidth()
+                // safeDrawing is system bars + cutout + IME, so the card shrinks as the keyboard
+                // animates in and the scrolling body below brings the focused field into view.
+                .safeDrawingPadding()
                 .padding(horizontal = 12.dp, vertical = 24.dp),
             shape = RoundedCornerShape(16.dp),
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
@@ -100,7 +129,7 @@ fun BookingDetailsDialog(
 
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        "Booking Details",
+                        stringResource(R.string.booking_title),
                         style = MaterialTheme.typography.titleLarge,
                         fontWeight = FontWeight.Bold,
                         modifier = Modifier.weight(1f),
@@ -109,13 +138,16 @@ fun BookingDetailsDialog(
                         onClick = onDismiss,
                         enabled = !isSubmitting,
                     ) {
-                        Icon(Icons.Filled.Close, contentDescription = "Close")
+                        Icon(
+                            Icons.Filled.Close,
+                            contentDescription = stringResource(R.string.booking_close),
+                        )
                     }
                 }
 
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    "All fields are required. Once booked, this lead's status can't be changed.",
+                    stringResource(R.string.booking_subtitle),
                     style = MaterialTheme.typography.bodySmall,
                     color = CrmOnSurfaceVar,
                 )
@@ -128,17 +160,19 @@ fun BookingDetailsDialog(
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
 
-                    // ── Customer ──────────────────────────────────────────────────────────────
+                    // ── Traveller Information ─────────────────────────────────────────────────
+                    SectionHeader(stringResource(R.string.booking_section_traveller))
+
                     FieldPair {
                         BookingField(
-                            label = "Full Name",
+                            label = stringResource(R.string.booking_field_full_name),
                             value = form.fullName,
                             onValueChange = { form = form.copy(fullName = it) },
                             error = errors.fullName,
                             modifier = Modifier.weight(1f),
                         )
                         BookingField(
-                            label = "Email ID",
+                            label = stringResource(R.string.booking_field_email),
                             value = form.emailId,
                             onValueChange = { form = form.copy(emailId = it) },
                             error = errors.emailId,
@@ -149,15 +183,16 @@ fun BookingDetailsDialog(
 
                     FieldPair {
                         BookingField(
-                            label = "Contact Number",
+                            label = stringResource(R.string.booking_field_phone),
                             value = form.contactNumber,
                             onValueChange = { form = form.copy(contactNumber = it) },
                             error = errors.contactNumber,
                             keyboardType = KeyboardType.Phone,
+                            supporting = stringResource(R.string.booking_phone_hint),
                             modifier = Modifier.weight(1f),
                         )
                         BookingField(
-                            label = "Emergency Contact Number",
+                            label = stringResource(R.string.booking_field_emergency_phone),
                             value = form.emergencyContactNumber,
                             onValueChange = { form = form.copy(emergencyContactNumber = it) },
                             error = errors.emergencyContactNumber,
@@ -166,20 +201,44 @@ fun BookingDetailsDialog(
                         )
                     }
 
-                    HorizontalDivider(Modifier.padding(vertical = 4.dp))
+                    FieldPair {
+                        BookingField(
+                            label = stringResource(R.string.booking_field_adults),
+                            value = form.adults,
+                            onValueChange = { entered ->
+                                form = form.copy(adults = entered.filter(Char::isDigit))
+                            },
+                            error = errors.adults,
+                            keyboardType = KeyboardType.Number,
+                            modifier = Modifier.weight(1f),
+                        )
+                        BookingField(
+                            label = stringResource(R.string.booking_field_children),
+                            value = form.children,
+                            onValueChange = { entered ->
+                                form = form.copy(children = entered.filter(Char::isDigit))
+                            },
+                            error = errors.children,
+                            keyboardType = KeyboardType.Number,
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
 
-                    // ── Trip ──────────────────────────────────────────────────────────────────
+                    // ── Trip & Package Details ────────────────────────────────────────────────
+                    SectionHeader(stringResource(R.string.booking_section_trip))
+
                     FieldPair {
                         if (products.isEmpty()) {
                             BookingField(
-                                label = "Package Name",
+                                label = stringResource(R.string.booking_field_package),
                                 value = form.packageName,
                                 onValueChange = { form = form.copy(packageName = it) },
                                 error = errors.packageName,
                                 modifier = Modifier.weight(1f),
                             )
                         } else {
-                            PackageDropdown(
+                            BookingDropdown(
+                                label = stringResource(R.string.booking_field_package),
                                 value = form.packageName,
                                 options = products,
                                 onValueChange = { form = form.copy(packageName = it) },
@@ -188,27 +247,25 @@ fun BookingDetailsDialog(
                             )
                         }
                         BookingField(
-                            label = "No. of Pax",
-                            value = form.noOfPax,
-                            onValueChange = { entered ->
-                                form = form.copy(noOfPax = entered.filter(Char::isDigit))
-                            },
-                            error = errors.noOfPax,
-                            keyboardType = KeyboardType.Number,
+                            label = stringResource(R.string.booking_field_destination),
+                            value = form.location,
+                            onValueChange = { form = form.copy(location = it) },
+                            error = errors.location,
+                            placeholder = stringResource(R.string.booking_location_hint),
                             modifier = Modifier.weight(1f),
                         )
                     }
 
                     FieldPair {
                         DateField(
-                            label = "Start Date",
+                            label = stringResource(R.string.booking_field_start_date),
                             millis = form.startDateMillis,
                             error = errors.startDate,
                             onClick = { datePickerTarget = BookingDateField.START },
                             modifier = Modifier.weight(1f),
                         )
                         DateField(
-                            label = "End Date",
+                            label = stringResource(R.string.booking_field_end_date),
                             millis = form.endDateMillis,
                             error = errors.endDate,
                             onClick = { datePickerTarget = BookingDateField.END },
@@ -216,12 +273,12 @@ fun BookingDetailsDialog(
                         )
                     }
 
-                    HorizontalDivider(Modifier.padding(vertical = 4.dp))
+                    // ── Billing & Transaction Verification ───────────────────────────────────
+                    SectionHeader(stringResource(R.string.booking_section_billing))
 
-                    // ── Payment ───────────────────────────────────────────────────────────────
                     FieldPair {
                         BookingField(
-                            label = "Total Amount (₹)",
+                            label = stringResource(R.string.booking_field_total_amount),
                             value = form.totalAmount,
                             onValueChange = { entered ->
                                 form = form.copy(totalAmount = entered.filter(Char::isDigit))
@@ -231,7 +288,7 @@ fun BookingDetailsDialog(
                             modifier = Modifier.weight(1f),
                         )
                         BookingField(
-                            label = "Paid Amount (₹)",
+                            label = stringResource(R.string.booking_field_paid_amount),
                             value = form.paidAmount,
                             onValueChange = { entered ->
                                 form = form.copy(paidAmount = entered.filter(Char::isDigit))
@@ -242,18 +299,43 @@ fun BookingDetailsDialog(
                         )
                     }
 
-                    BookingField(
-                        label = "Due Amount (₹)",
-                        value = form.dueAmount,
-                        onValueChange = { entered ->
-                            dueEdited = true
-                            form = form.copy(dueAmount = entered.filter(Char::isDigit))
-                        },
-                        error = errors.dueAmount,
-                        keyboardType = KeyboardType.Number,
-                        imeAction = ImeAction.Done,
-                        supporting = if (!dueEdited) "Auto-filled from total minus paid" else null,
+                    // Read-only, not merely auto-filled: the backend derives due from total minus paid
+                    // on save, so a number typed here would be silently discarded.
+                    ReadOnlyField(
+                        label = stringResource(R.string.booking_field_due_amount),
+                        value = form.impliedDueAmount?.toString().orEmpty(),
+                        supporting = stringResource(R.string.booking_due_hint),
                         modifier = Modifier.fillMaxWidth(),
+                    )
+
+                    FieldPair {
+                        BookingField(
+                            label = stringResource(R.string.booking_field_transaction_id),
+                            value = form.transactionId,
+                            // Not filtered as you type: a rejected character is worth an explanation,
+                            // and silently swallowing keystrokes reads as a broken field.
+                            onValueChange = { form = form.copy(transactionId = it.trim()) },
+                            error = errors.transactionId,
+                            imeAction = ImeAction.Done,
+                            modifier = Modifier.weight(1f),
+                        )
+                        // Fixed, not merely pre-selected: every booking is paid into the HDFC account,
+                        // so there is nothing here for the agent to choose. Shows the exact string sent
+                        // to the API rather than a friendlier label, so the field can't disagree with
+                        // what an admin sees against the payment in the backend.
+                        ReadOnlyField(
+                            label = stringResource(R.string.booking_field_payment_mode),
+                            value = form.paymentMode.apiValue,
+                            supporting = stringResource(R.string.booking_payment_mode_hint),
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+
+                    ScreenshotField(
+                        fileName = form.screenshotName,
+                        error = errors.screenshot,
+                        enabled = !isSubmitting,
+                        onPick = { screenshotPicker.launch(SCREENSHOT_MIME_TYPES) },
                     )
                 }
 
@@ -264,7 +346,9 @@ fun BookingDetailsDialog(
                     horizontalArrangement = Arrangement.End,
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    TextButton(onClick = onDismiss, enabled = !isSubmitting) { Text("Cancel") }
+                    TextButton(onClick = onDismiss, enabled = !isSubmitting) {
+                        Text(stringResource(R.string.booking_cancel))
+                    }
                     Spacer(Modifier.width(8.dp))
                     Button(
                         onClick = {
@@ -283,9 +367,12 @@ fun BookingDetailsDialog(
                                 color = MaterialTheme.colorScheme.onPrimary,
                             )
                             Spacer(Modifier.width(8.dp))
-                            Text("Booking…")
+                            Text(stringResource(R.string.booking_submitting))
                         } else {
-                            Text("Confirm Booking", fontWeight = FontWeight.SemiBold)
+                            Text(
+                                stringResource(R.string.booking_submit),
+                                fontWeight = FontWeight.SemiBold,
+                            )
                         }
                     }
                 }
@@ -319,8 +406,25 @@ fun BookingDetailsDialog(
     }
 }
 
+/** What the backend accepts for a transaction screenshot. Narrower than a note attachment. */
+private val SCREENSHOT_MIME_TYPES = arrayOf("image/png", "image/jpeg", "application/pdf")
+
 /** Which of the two date fields the picker is currently open for. */
 private enum class BookingDateField { START, END }
+
+/** One of the spec's three groupings. */
+@Composable
+private fun SectionHeader(title: String) {
+    Column {
+        HorizontalDivider(Modifier.padding(bottom = 10.dp))
+        Text(
+            title,
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.Bold,
+            color = CrmPrimary,
+        )
+    }
+}
 
 /** The mockup's two-up layout. Kept as one place so every row shares the same gap. */
 @Composable
@@ -342,6 +446,7 @@ private fun BookingField(
     keyboardType: KeyboardType = KeyboardType.Text,
     imeAction: ImeAction = ImeAction.Next,
     supporting: String? = null,
+    placeholder: String? = null,
 ) {
     Column(modifier) {
         BookingFieldLabel(label)
@@ -352,6 +457,9 @@ private fun BookingField(
             modifier = Modifier.fillMaxWidth(),
             singleLine = true,
             isError = error != null,
+            placeholder = placeholder?.let {
+                { Text(it, fontSize = 13.sp, color = CrmOnSurfaceVar) }
+            },
             shape = RoundedCornerShape(10.dp),
             textStyle = MaterialTheme.typography.bodyMedium,
             keyboardOptions = KeyboardOptions(keyboardType = keyboardType, imeAction = imeAction),
@@ -363,9 +471,40 @@ private fun BookingField(
     }
 }
 
+/** A value the agent can read but not set — it's derived, or the server owns it. */
+@Composable
+private fun ReadOnlyField(
+    label: String,
+    value: String,
+    supporting: String?,
+    modifier: Modifier = Modifier,
+) {
+    Column(modifier) {
+        BookingFieldLabel(label, required = false)
+        Spacer(Modifier.height(4.dp))
+        OutlinedTextField(
+            value = value,
+            onValueChange = {},
+            readOnly = true,
+            enabled = false,
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            shape = RoundedCornerShape(10.dp),
+            textStyle = MaterialTheme.typography.bodyMedium,
+            supportingText = supporting?.let { { Text(it, fontSize = 11.sp) } },
+            colors = OutlinedTextFieldDefaults.colors(
+                disabledBorderColor = MaterialTheme.colorScheme.outline,
+                disabledTextColor = MaterialTheme.colorScheme.onSurface,
+                disabledSupportingTextColor = CrmOnSurfaceVar,
+            ),
+        )
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun PackageDropdown(
+private fun BookingDropdown(
+    label: String,
     value: String,
     options: List<String>,
     onValueChange: (String) -> Unit,
@@ -374,7 +513,7 @@ private fun PackageDropdown(
 ) {
     var expanded by remember { mutableStateOf(false) }
     Column(modifier) {
-        BookingFieldLabel("Package Name")
+        BookingFieldLabel(label)
         Spacer(Modifier.height(4.dp))
         ExposedDropdownMenuBox(
             expanded = expanded,
@@ -384,7 +523,13 @@ private fun PackageDropdown(
                 value = value,
                 onValueChange = {},
                 readOnly = true,
-                placeholder = { Text("Select", fontSize = 13.sp, color = CrmOnSurfaceVar) },
+                placeholder = {
+                    Text(
+                        stringResource(R.string.booking_select_hint),
+                        fontSize = 13.sp,
+                        color = CrmOnSurfaceVar,
+                    )
+                },
                 trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
                 modifier = Modifier
                     .fillMaxWidth()
@@ -411,6 +556,59 @@ private fun PackageDropdown(
     }
 }
 
+/**
+ * The transaction proof. Shows the picked filename rather than a preview: the agent needs to confirm
+ * they attached the right file, and a PDF has no thumbnail to show anyway.
+ */
+@Composable
+private fun ScreenshotField(
+    fileName: String?,
+    error: String?,
+    enabled: Boolean,
+    onPick: () -> Unit,
+) {
+    Column(Modifier.fillMaxWidth()) {
+        BookingFieldLabel(stringResource(R.string.booking_field_screenshot))
+        Spacer(Modifier.height(4.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedButton(
+                onClick = onPick,
+                enabled = enabled,
+                shape = RoundedCornerShape(10.dp),
+            ) {
+                Icon(
+                    Icons.Filled.AttachFile,
+                    contentDescription = null,
+                    modifier = Modifier.size(16.dp),
+                )
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    stringResource(
+                        if (fileName == null) R.string.booking_screenshot_add
+                        else R.string.booking_screenshot_replace
+                    ),
+                    fontSize = 13.sp,
+                )
+            }
+            Spacer(Modifier.width(10.dp))
+            Text(
+                fileName ?: stringResource(
+                    R.string.booking_screenshot_hint,
+                    DocumentPartFactory.MAX_SCREENSHOT_SIZE_MB,
+                ),
+                fontSize = 11.sp,
+                color = if (fileName != null) MaterialTheme.colorScheme.onSurface else CrmOnSurfaceVar,
+                maxLines = 2,
+                modifier = Modifier.weight(1f),
+            )
+        }
+        error?.let {
+            Spacer(Modifier.height(4.dp))
+            Text(it, fontSize = 11.sp, color = MaterialTheme.colorScheme.error)
+        }
+    }
+}
+
 /** Read-only field that opens the date picker on tap — the mockup's `dd-mm-yyyy` input. */
 @Composable
 private fun DateField(
@@ -428,7 +626,7 @@ private fun DateField(
             onValueChange = {},
             readOnly = true,
             enabled = false,
-            placeholder = { Text("dd-mm-yyyy", fontSize = 13.sp) },
+            placeholder = { Text(stringResource(R.string.booking_date_hint), fontSize = 13.sp) },
             trailingIcon = { Icon(Icons.Filled.DateRange, contentDescription = null, tint = CrmPrimary) },
             // `enabled = false` is what stops the keyboard appearing for a field the agent can only
             // fill from the picker. A disabled field doesn't consume touches, so the clickable on the
@@ -453,7 +651,7 @@ private fun DateField(
 }
 
 @Composable
-private fun BookingFieldLabel(label: String) {
+private fun BookingFieldLabel(label: String, required: Boolean = true) {
     Row {
         Text(
             label,
@@ -461,7 +659,14 @@ private fun BookingFieldLabel(label: String) {
             fontWeight = FontWeight.SemiBold,
             color = MaterialTheme.colorScheme.onSurface,
         )
-        Text(" *", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.error)
+        if (required) {
+            Text(
+                " *",
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
     }
 }
 
@@ -483,10 +688,27 @@ private fun BookingDatePicker(
                 onClick = { state.selectedDateMillis?.let { onPicked(it.utcDateToLocalMidnight()) } },
             ) { Text("OK") }
         },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.booking_cancel)) }
+        },
     ) {
         DatePicker(state = state)
     }
+}
+
+/** The picked file's name for display. Falls back to the last path segment when no provider answers. */
+private fun android.content.Context.resolveDisplayName(uri: Uri): String {
+    val fromCursor = runCatching {
+        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+            ?.use { cursor ->
+                if (!cursor.moveToFirst()) return@use null
+                val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (index >= 0) cursor.getString(index) else null
+            }
+    }.getOrNull()
+    return fromCursor?.takeIf { it.isNotBlank() }
+        ?: uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
+        ?: "screenshot"
 }
 
 /**

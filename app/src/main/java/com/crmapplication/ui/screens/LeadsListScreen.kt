@@ -21,11 +21,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
+import com.salescrm.R
 import com.crmapplication.LeadDetailVM.repository.Lead
 import com.crmapplication.ui.component.LeadCard
 import com.crmapplication.ui.theme.CrmOnBackground
@@ -46,8 +48,8 @@ fun LeadsListScreen(
     val state by viewModel.state.collectAsState()
     var showSortMenu by remember { mutableStateOf(false) }
 
-    // Booking can fail (403 if the lead was reassigned, 400 on a rejected payload) and the form stays
-    // open on failure, so this screen needs somewhere to surface the message.
+    // Booking can fail (403 if the lead was reassigned, 400 on a rejected payload) and the form closes
+    // either way, so this screen needs somewhere to surface the message.
     val snackbarHostState = remember { SnackbarHostState() }
     LaunchedEffect(state.error) {
         state.error?.let { message ->
@@ -55,9 +57,16 @@ fun LeadsListScreen(
             viewModel.clearError()
         }
     }
+    // Both resolved up front: stringResource isn't callable inside the effect, and which one is used
+    // depends on whether the server sent back a booking id.
+    val bookedMessage = stringResource(R.string.booking_success)
+    val bookedWithIdTemplate = stringResource(R.string.booking_success_with_id)
     LaunchedEffect(state.bookingSuccess) {
         if (state.bookingSuccess) {
-            snackbarHostState.showSnackbar("Lead booked. Status is now locked.")
+            val bookingId = state.lastBooking?.bookingId
+            snackbarHostState.showSnackbar(
+                if (bookingId != null) bookedWithIdTemplate.format(bookingId) else bookedMessage
+            )
             viewModel.clearBookingSuccess()
         }
     }
@@ -190,6 +199,10 @@ fun LeadsListScreen(
                                 products = state.availableProducts,
                                 selected = state.activeProduct,
                                 onSelect = { viewModel.setProductFilter(it) },
+                                // Catalog is server-owned: re-fetch as the menu opens so a product
+                                // added on the backend is filterable without leaving this screen.
+                                // Throttled in the repository. Mirrors the Add Lead dropdown.
+                                onExpand = { viewModel.refreshConfig() },
                             )
                         }
                     }
@@ -347,6 +360,8 @@ private fun ProductFilter(
     products: List<String>,
     selected: String?,
     onSelect: (String?) -> Unit,
+    /** Fired when the menu opens, so the server-owned catalog can refresh just before it's read. */
+    onExpand: () -> Unit = {},
 ) {
     var expanded by remember { mutableStateOf(false) }
     val active = selected != null
@@ -359,7 +374,10 @@ private fun ProductFilter(
             shadowElevation = if (active) 2.dp else 0.dp,
             modifier = Modifier
                 .height(52.dp)
-                .clickable { expanded = true },
+                .clickable {
+                    expanded = true
+                    onExpand()
+                },
         ) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,

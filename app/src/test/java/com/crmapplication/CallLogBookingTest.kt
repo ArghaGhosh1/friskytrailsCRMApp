@@ -7,8 +7,12 @@ import com.crmapplication.LeadDetailVM.repository.mergeLabels
 import com.crmapplication.calllog.CallLogEntry
 import com.crmapplication.calllog.CallType
 import com.crmapplication.calllog.callStats
+import com.crmapplication.calllog.countsAsConnected
+import com.crmapplication.calllog.countsAsDial
 import com.crmapplication.calllog.normalizedPhoneKey
+import com.crmapplication.calllog.talkTimeSeconds
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -226,6 +230,20 @@ class CallLogBookingTest {
     }
 
     @Test
+    fun `a lead whose only call was a marked voicemail is Dialed, not Connected`() {
+        // The label is pushed to the backend, so leaving it on raw duration would contradict the
+        // Connected Calls figure the dashboard shows for the same call.
+        assertEquals("Dialed", callLabelFor(listOf(dialed.copy(isVoicemail = true))))
+    }
+
+    @Test
+    fun `one real connection still labels the lead Connected despite a marked voicemail`() {
+        val marked = dialed.copy(id = 50L, isVoicemail = true)
+        val answered = incoming.copy(id = 51L, durationSeconds = 30L)
+        assertEquals("Connected", callLabelFor(listOf(marked, answered)))
+    }
+
+    @Test
     fun `no calls means no label`() {
         assertNull(callLabelFor(emptyList()))
     }
@@ -265,6 +283,99 @@ class CallLogBookingTest {
         assertEquals(3, stats.totalCalls)
 
         assertEquals(165L, stats.totalDurationSeconds)
+    }
+
+    /**
+     * A voicemail carries a real duration but nobody answered it, so it must not be credited as talk
+     * time. It stays in the call count and in the history list — it happened — but contributes zero
+     * seconds, which is what already made it contribute zero dials.
+     */
+    @Test
+    fun `voicemail time is not talk time`() {
+        val voicemail = dialed.copy(id = 4L, type = CallType.VOICEMAIL, durationSeconds = 300L)
+        assertEquals(0L, voicemail.talkTimeSeconds)
+        assertEquals("an answered call still counts in full", 120L, dialed.talkTimeSeconds)
+    }
+
+    @Test
+    fun `callStats keeps voicemail in the count but out of the duration`() {
+        val voicemail = dialed.copy(id = 4L, type = CallType.VOICEMAIL, durationSeconds = 300L)
+        val stats = callStats(listOf(dialed, incoming, voicemail))
+
+        assertEquals("the voicemail is still a real call", 3, stats.totalCalls)
+        assertEquals("120s + 45s, the 300s voicemail excluded", 165L, stats.totalDurationSeconds)
+        // The lead-detail screen shows this total beside the two directional chips, so it must equal
+        // their sum rather than exceeding it by voicemail time that has no chip of its own.
+        assertEquals(
+            stats.outgoingDurationSeconds + stats.incomingDurationSeconds,
+            stats.totalDurationSeconds,
+        )
+    }
+
+    /**
+     * The agent-marked flag, which is a different thing from CallType.VOICEMAIL: Android records a
+     * machine that answers exactly like a person who answers, so only the agent can tell us.
+     *
+     * It removes talk time and connected status but deliberately KEEPS the dial — the agent really did
+     * place the call, so they keep credit for the attempt.
+     */
+    @Test
+    fun `an agent-marked voicemail keeps its dial but loses its talk time`() {
+        val marked = dialed.copy(isVoicemail = true)
+
+        assertEquals("no talk time credited", 0L, marked.talkTimeSeconds)
+        assertTrue("the agent still dialled", marked.countsAsDial)
+        assertFalse("but nobody answered", marked.countsAsConnected)
+        assertEquals("the real length is still on the row", 120L, marked.durationSeconds)
+    }
+
+    @Test
+    fun `marking one call does not affect the other calls to that number`() {
+        // Per-call, never per-number: the same lead can go to voicemail once and pick up next time.
+        val first = dialed.copy(id = 30L, isVoicemail = true)
+        val second = dialed.copy(id = 31L, durationSeconds = 90L)
+
+        assertEquals(0L, first.talkTimeSeconds)
+        assertEquals(90L, second.talkTimeSeconds)
+        assertEquals("only the unmarked call's time counts", 90L, callStats(listOf(first, second)).totalDurationSeconds)
+    }
+
+    @Test
+    fun `booking figures drop a marked call's time but not its dial`() {
+        val now = 1_700_100_000_000L
+        val answered = dialed.copy(id = 40L, dateMillis = now - 2_000L, durationSeconds = 120L)
+        val markedVoicemail = dialed.copy(
+            id = 41L,
+            dateMillis = now - 1_000L,
+            durationSeconds = 300L,
+            isVoicemail = true,
+        )
+
+        val body = bookingFromCalls(listOf(answered, markedVoicemail), now = now)!!
+
+        assertEquals("both attempts count as dials", 2, body.totalDial)
+        assertEquals("only one reached a person", 1, body.connected)
+        assertEquals("the 300s voicemail is not talk time", "2:00", body.talkTime)
+        assertTrue("connected <= dials", body.connected <= body.totalDial)
+    }
+
+    @Test
+    fun `booking talk time excludes voicemail`() {
+        val now = 1_700_100_000_000L
+        val out = dialed.copy(id = 20L, dateMillis = now - 2_000L, durationSeconds = 120L)
+        val voicemail = dialed.copy(
+            id = 21L,
+            type = CallType.VOICEMAIL,
+            dateMillis = now - 1_000L,
+            durationSeconds = 300L,
+        )
+
+        val body = bookingFromCalls(listOf(out, voicemail), now = now)!!
+
+        assertEquals("only the 120s answered call", "2:00", body.talkTime)
+        assertEquals("2:00", body.dailyTalkTime)
+        assertEquals("a voicemail is not a dial", 1, body.totalDial)
+        assertEquals(1, body.connected)
     }
 
     private fun formatExpected(epochMs: Long): String =

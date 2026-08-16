@@ -1,6 +1,8 @@
 package com.crmapplication.ui.screens
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -42,6 +44,7 @@ import com.crmapplication.LeadDetailVM.repository.isBooked
 import com.crmapplication.calllog.CallLogEntry
 import com.crmapplication.calllog.CallType
 import com.crmapplication.calllog.callStats
+import com.crmapplication.calllog.canBeMarkedVoicemail
 import com.crmapplication.ui.component.AttachmentActionSheet
 import com.crmapplication.ui.component.ImagePreviewDialog
 import com.crmapplication.ui.component.NoteItem
@@ -199,9 +202,16 @@ fun LeadDetailScreen(
             leadsVm.clearError()
         }
     }
+    // Both resolved up front: stringResource isn't callable inside the effect, and which one is used
+    // depends on whether the server sent back a booking id.
+    val bookedMessage = stringResource(R.string.booking_success)
+    val bookedWithIdTemplate = stringResource(R.string.booking_success_with_id)
     LaunchedEffect(leadsState.bookingSuccess) {
         if (leadsState.bookingSuccess) {
-            snackbarHostState.showSnackbar("Lead booked. Status is now locked.")
+            val bookingId = leadsState.lastBooking?.bookingId
+            snackbarHostState.showSnackbar(
+                if (bookingId != null) bookedWithIdTemplate.format(bookingId) else bookedMessage
+            )
             leadsVm.clearBookingSuccess()
         }
     }
@@ -218,6 +228,7 @@ fun LeadDetailScreen(
     val downloadStartedTemplate = stringResource(R.string.attachment_download_started)
     val downloadFailedMessage = stringResource(R.string.attachment_download_failed)
     val noAppMessage = stringResource(R.string.attachment_no_app)
+    val leadCopiedMessage = stringResource(R.string.lead_details_copied)
     val storagePermissionMessage = stringResource(R.string.attachment_storage_permission_needed)
 
     fun notify(message: String) {
@@ -277,7 +288,10 @@ fun LeadDetailScreen(
                     actions = {
 
                         IconButton(onClick = {
-                            lead?.let { context.shareLead(it) }
+                            lead?.let {
+                                context.copyLeadDetails(it)
+                                if (needsOwnCopyConfirmation) notify(leadCopiedMessage)
+                            }
                         }) {
                             Text("🔗", fontSize = 20.sp)
                         }
@@ -344,6 +358,8 @@ fun LeadDetailScreen(
                         lead.source?.let { source ->
                             InfoRow("Source", source)
                         }
+                        // Tapping the number opens the call history, where each call can be marked as
+                        // a voicemail.
                         PhoneRow(phone = lead.phone, onClick = { detailVm.openCallHistory(lead.phone) })
 
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -692,6 +708,7 @@ fun LeadDetailScreen(
             needsPermission = callHistory.needsPermission,
             calls = callHistory.calls,
             onGrantPermission = { callLogPermissionLauncher.launch(Manifest.permission.READ_CALL_LOG) },
+            onToggleVoicemail = { call, isVoicemail -> detailVm.setCallVoicemail(call, isVoicemail) },
             onDismiss = { detailVm.closeCallHistory() },
         )
     }
@@ -774,6 +791,7 @@ private fun CallHistoryDialog(
     needsPermission: Boolean,
     calls: List<CallLogEntry>,
     onGrantPermission: () -> Unit,
+    onToggleVoicemail: (CallLogEntry, Boolean) -> Unit,
     onDismiss: () -> Unit,
 ) {
     AlertDialog(
@@ -788,7 +806,7 @@ private fun CallHistoryDialog(
         dismissButton = if (needsPermission) {
             { TextButton(onClick = onDismiss) { Text("Cancel") } }
         } else null,
-        title = { Text("Call history") },
+        title = { Text(stringResource(R.string.call_history_title)) },
         text = {
             Column {
                 Text(
@@ -853,10 +871,28 @@ private fun CallHistoryDialog(
                             }
                         }
                         Spacer(Modifier.height(8.dp))
+                        // Says what the per-call checkboxes below are for; without it the feature is
+                        // discoverable only by noticing them and guessing.
+                        //
+                        // Shown only when some call actually offers a checkbox. Unconditionally it
+                        // told the agent to "tick any call" on a list where every call was
+                        // zero-duration and therefore unmarkable, which reads as the feature being
+                        // missing rather than inapplicable.
+                        if (calls.any { it.canBeMarkedVoicemail() }) {
+                            Text(
+                                stringResource(R.string.call_history_voicemail_hint),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Spacer(Modifier.height(8.dp))
+                        }
                         HorizontalDivider()
                         LazyColumn(Modifier.heightIn(max = 320.dp)) {
                             items(calls, key = { it.id }) { call ->
-                                CallRow(call)
+                                CallRow(
+                                    call = call,
+                                    onToggleVoicemail = { onToggleVoicemail(call, it) },
+                                )
                             }
                         }
                     }
@@ -896,38 +932,88 @@ private fun DirectionSummary(
 }
 
 @Composable
-private fun CallRow(call: CallLogEntry) {
+private fun CallRow(
+    call: CallLogEntry,
+    onToggleVoicemail: (Boolean) -> Unit,
+) {
     val directionColor = when (call.type) {
         CallType.OUTGOING -> OutgoingColor
         CallType.INCOMING -> IncomingColor
         CallType.MISSED, CallType.REJECTED, CallType.BLOCKED -> MissedColor
         else -> MaterialTheme.colorScheme.onSurface
     }
-    Row(
-        Modifier.fillMaxWidth().padding(vertical = 8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Text(call.type.icon, fontSize = 18.sp)
-        Spacer(Modifier.width(10.dp))
-        Column(Modifier.weight(1f)) {
+    // Offered only where there is talk time to discount, and only for calls read from this device —
+    // a server-backfilled row has a synthetic id that can't be written back.
+    //
+    // Gated on raw `durationSeconds`, deliberately NOT on talk time or connected state: marking a call
+    // zeroes those, so gating on them would make the control vanish the moment it was used and leave
+    // the agent unable to undo a mistake.
+    val canMarkVoicemail = call.canBeMarkedVoicemail()
+    Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(if (call.isVoicemail) "📨" else call.type.icon, fontSize = 18.sp)
+            Spacer(Modifier.width(10.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    if (call.isVoicemail) {
+                        "${call.type.label} · ${stringResource(R.string.call_history_voicemail_badge)}"
+                    } else {
+                        call.type.label
+                    },
+                    fontWeight = FontWeight.Medium,
+                    color = if (call.isVoicemail) MaterialTheme.colorScheme.onSurfaceVariant else directionColor,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Text(
+                    formatCallTime(call.dateMillis),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
             Text(
-                call.type.label,
-                fontWeight = FontWeight.Medium,
-                color = directionColor,
+                if (call.durationSeconds > 0) formatDuration(call.durationSeconds) else "—",
                 style = MaterialTheme.typography.bodyMedium,
-            )
-            Text(
-                formatCallTime(call.dateMillis),
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontWeight = FontWeight.SemiBold,
+                // Struck through when marked, so the agent can still see the real length while the
+                // figure is visibly not counted.
+                textDecoration = if (call.isVoicemail) TextDecoration.LineThrough else null,
+                color = if (call.durationSeconds > 0 && !call.isVoicemail) {
+                    directionColor
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                },
             )
         }
-        Text(
-            if (call.durationSeconds > 0) formatDuration(call.durationSeconds) else "—",
-            style = MaterialTheme.typography.bodyMedium,
-            fontWeight = FontWeight.SemiBold,
-            color = if (call.durationSeconds > 0) directionColor else MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+        if (canMarkVoicemail) {
+            // A checkbox, so the marked/unmarked state of every call is visible at a glance down the
+            // list and the agent can tick the one call that went to voicemail. The whole row is
+            // clickable, not just the box, so it doesn't need a precise tap.
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable { onToggleVoicemail(!call.isVoicemail) }
+                    .padding(top = 2.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Checkbox(
+                    checked = call.isVoicemail,
+                    // null: the click is handled by the Row above, which keeps the box and its label
+                    // acting as one target instead of two.
+                    onCheckedChange = null,
+                    modifier = Modifier.size(28.dp),
+                )
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    stringResource(R.string.call_history_voicemail_checkbox),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = if (call.isVoicemail) {
+                        MaterialTheme.colorScheme.primary
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                )
+            }
+        }
     }
 }
 
@@ -1043,22 +1129,34 @@ private fun StatusHistoryRow(change: StatusChange) {
     }
 }
 
-private fun Context.shareLead(lead: Lead) {
-    val link = "$LEAD_LINK_BASE${lead.id}"
+/**
+ * Puts the five fields an agent pastes elsewhere on the clipboard, in the order the 🔗 button promises:
+ * product name, status, name, lead id, link.
+ *
+ * Deliberately not the phone number — this text gets pasted into group chats, and the previous share
+ * sheet leaked it there by default.
+ *
+ * A missing product drops its line rather than printing a bare label, matching how a blank status is
+ * skipped: `Product Name:` followed by nothing reads as a broken copy, not an empty field.
+ */
+private fun Context.copyLeadDetails(lead: Lead) {
     val text = buildString {
-        append("Frisky Trails CRM — Lead\n\n")
+        lead.product?.takeIf { it.isNotBlank() }?.let { append("Product Name: $it\n") }
+        if (lead.status.isNotBlank()) append("Lead Status: ${lead.status}\n")
         append("Name: ${lead.name}\n")
-        append("Phone: ${lead.phone}\n")
-        if (lead.status.isNotBlank()) append("Status: ${lead.status}\n")
-        append("\nView lead: $link")
+        append("Lead ID: ${lead.id}\n")
+        append("Lead Link: $LEAD_LINK_BASE${lead.id}")
     }
-    val sendIntent = Intent(Intent.ACTION_SEND).apply {
-        type = "text/plain"
-        putExtra(Intent.EXTRA_SUBJECT, "Frisky Trails Lead: ${lead.name}")
-        putExtra(Intent.EXTRA_TEXT, text)
-    }
-    startActivity(Intent.createChooser(sendIntent, "Share lead via"))
+    val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+    clipboard.setPrimaryClip(ClipData.newPlainText(lead.name, text))
 }
+
+/**
+ * Android 13 shows its own clipboard confirmation, so the app's snackbar would be a second one saying
+ * the same thing.
+ */
+private val needsOwnCopyConfirmation: Boolean
+    get() = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU
 
 private const val LEAD_LINK_BASE = "https://friskytrails-crm.vercel.app/leads/"
 

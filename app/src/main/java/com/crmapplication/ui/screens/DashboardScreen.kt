@@ -265,7 +265,9 @@ private fun PerformanceCard(stats: DashboardStats) {
         StatMetric("⏱️", "Total Talktime", stats.totalTalktime),
         StatMetric("✅", "Connected Calls", stats.connectedCalls.toString()),
         StatMetric("👤", "Unique Calls", stats.uniqueCalls.toString()),
-        StatMetric("🔁", "Call more than…", stats.callMoreThan.toString()),
+        // Label spells out the threshold now that this counts long calls by duration rather than
+        // numbers dialled repeatedly — "Call more than…" gave no clue what the figure measured.
+        StatMetric("⏳", "Call more than 5 min", stats.callMoreThan.toString()),
         StatMetric("🕛", "First Call", stats.firstCall ?: "—"),
         StatMetric("🕔", "Last Call", stats.lastCall ?: "—"),
         StatMetric("😴", "Idle Time", stats.idleTime),

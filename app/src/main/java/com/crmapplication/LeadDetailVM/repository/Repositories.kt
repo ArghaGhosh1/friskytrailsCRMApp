@@ -5,6 +5,7 @@ import android.util.Base64
 import android.util.Log
 import com.crmapplication.LeadDetailVM.local.BugReportDao
 import com.crmapplication.LeadDetailVM.local.BugReportEntity
+import com.crmapplication.LeadDetailVM.local.CallDao
 import com.crmapplication.LeadDetailVM.local.LeadDao
 import com.crmapplication.LeadDetailVM.local.LeadEntity
 import com.crmapplication.LeadDetailVM.local.NoteDao
@@ -21,12 +22,16 @@ import com.crmapplication.LeadDetailVM.remote.ApiConfig
 import com.crmapplication.LeadDetailVM.remote.ApiNoteDto
 import com.crmapplication.LeadDetailVM.remote.AuthApi
 import com.crmapplication.LeadDetailVM.remote.AuthLoginRequest
+import com.crmapplication.LeadDetailVM.remote.BookingEnvelopeDto
+import com.crmapplication.LeadDetailVM.remote.BookingsApi
 import com.crmapplication.LeadDetailVM.remote.BugReportApi
 import com.crmapplication.LeadDetailVM.remote.BugStatus
 import com.crmapplication.LeadDetailVM.remote.CreateBugReportRequest
 import com.crmapplication.LeadDetailVM.remote.UpdateBugStatusRequest
 import com.crmapplication.LeadDetailVM.remote.UpdateLeadInfoRequest
 import com.crmapplication.LeadDetailVM.remote.CallsApi
+import com.crmapplication.LeadDetailVM.remote.CloudinaryApi
+import com.crmapplication.LeadDetailVM.remote.CloudinaryUploadDto
 import com.crmapplication.LeadDetailVM.remote.ConfigApi
 import com.crmapplication.LeadDetailVM.remote.HistoricalReportDto
 import com.crmapplication.LeadDetailVM.remote.LiveActivityDto
@@ -49,13 +54,17 @@ import com.crmapplication.LeadDetailVM.remote.UpdateStatusRequest
 import com.crmapplication.LeadDetailVM.remote.updateReminderBody
 import com.crmapplication.LeadDetailVM.remote.UploadApi
 import com.crmapplication.LeadDetailVM.remote.UploadResponse
+import com.crmapplication.LeadDetailVM.remote.UploadSignatureDto
 import com.crmapplication.LeadDetailVM.remote.VerifyEmailRequest
 import com.crmapplication.calllog.CallLogEntry
 import com.crmapplication.calllog.CallLogReader
 import com.crmapplication.calllog.CallType
+import com.crmapplication.calllog.countsAsConnected
 import com.crmapplication.calllog.countsAsDial
 import com.crmapplication.calllog.normalizedPhoneKey
+import com.crmapplication.calllog.talkTimeSeconds
 import com.crmapplication.utils.CallSyncStore
+import com.crmapplication.utils.cloudinaryPublicId
 import com.crmapplication.utils.DocumentPartFactory
 import com.crmapplication.utils.DueDateStore
 import com.crmapplication.utils.ProductCatalogStore
@@ -80,14 +89,19 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import okhttp3.MultipartBody
+import okhttp3.RequestBody
+import okhttp3.RequestBody.Companion.toRequestBody
 import retrofit2.HttpException
 import java.util.UUID
+import kotlin.math.abs
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -210,6 +224,76 @@ private fun parseUploadError(body: String?): String? = runCatching {
     }
 }.getOrNull()
 
+/** Our own backend's flat `{"error": "..."}` / `{"message": "..."}`, from the signature endpoint. */
+internal fun parseSignatureError(body: String?): String? = runCatching {
+    body?.takeIf { it.isNotBlank() }?.let {
+        val parsed = Gson().fromJson(it, UploadSignatureDto::class.java)
+        parsed?.error?.takeIf { e -> e.isNotBlank() }
+            ?: parsed?.message?.takeIf { m -> m.isNotBlank() }
+    }
+}.getOrNull()
+
+/** Cloudinary's nested `{"error": {"message": "..."}}`. */
+/**
+ * Pulls the booking API's own `error` string out of a failed response.
+ *
+ * Worth surfacing verbatim: its messages name the offending field ("Phone Number must be exactly 10
+ * digits starting with 6, 7, 8, or 9", "transaction ID already exists"), which is exactly what the
+ * agent needs to fix the form. A generic "Request failed (400)" would send them guessing.
+ */
+internal fun parseBookingError(body: String?): String? = runCatching {
+    body?.takeIf { it.isNotBlank() }?.let {
+        Gson().fromJson(it, BookingEnvelopeDto::class.java)?.error?.takeIf { e -> e.isNotBlank() }
+    }
+}.getOrNull()
+
+/** Only reached when the response carried no parseable `error` of its own. */
+internal fun friendlyBookingFailure(code: Int): String = when (code) {
+    // Not a bad payload: the route isn't there. Worth its own wording because the agent's form was
+    // fine and re-typing it won't help — `ApiConfig.BOOKING_BASE_URL` needs to point at the booking
+    // service. Without this the message read "Couldn't save the booking (HTTP 404)", which invites
+    // exactly the pointless retry it should prevent.
+    404 -> "The booking service isn't reachable at its configured address. " +
+        "Nothing was saved and retrying won't help — please report this, it needs a backend fix."
+    401, 403 -> "You're not authorised to create this booking. Try signing in again."
+    409 -> "A booking with that transaction ID already exists."
+    413 -> "The screenshot is too large. The maximum is ${DocumentPartFactory.MAX_SCREENSHOT_SIZE_MB} MB."
+    else -> "Couldn't save the booking (HTTP $code)."
+}
+
+internal fun parseCloudinaryError(body: String?): String? = runCatching {
+    body?.takeIf { it.isNotBlank() }?.let {
+        Gson().fromJson(it, CloudinaryUploadDto::class.java)?.error?.message?.takeIf { m -> m.isNotBlank() }
+    }
+}.getOrNull()
+
+/**
+ * Turns a Cloudinary upload failure into something an agent can act on.
+ *
+ * Two cases get rewritten because Cloudinary's own wording sends the reader in the wrong direction:
+ * its size error quotes the account limit without saying what to do, and its signature error reads
+ * like a client bug when in practice it means the signed parameters and the sent parameters
+ * disagreed — a backend-side mismatch the agent cannot fix by retrying.
+ */
+internal fun cloudinaryFailureMessage(cloudinaryMessage: String?, code: Int): String {
+    val message = cloudinaryMessage?.takeIf { it.isNotBlank() }
+        ?: return "Upload failed (HTTP $code)."
+    return when {
+        message.contains("File size too large", ignoreCase = true) ||
+            message.contains("too large", ignoreCase = true) ->
+            "That file is too large to upload. The maximum is ${DocumentPartFactory.MAX_FILE_SIZE_MB} MB."
+        message.contains("Invalid Signature", ignoreCase = true) ->
+            "Upload was rejected as unauthorised. Please try again, and report it if it keeps failing."
+        message.contains("Invalid extension", ignoreCase = true) ||
+            message.contains("Unsupported", ignoreCase = true) ->
+            "That file type isn't supported."
+        else -> message
+    }
+}
+
+/** A multipart form field. No content type: these are plain scalars, and Cloudinary expects them bare. */
+private fun String.toFormField(): RequestBody = toRequestBody()
+
 private fun friendlyApiMessage(serverError: String?, code: Int): String =
     serverError
         ?: if (code == 429) "Too many attempts. Please wait a few minutes and try again."
@@ -239,6 +323,9 @@ class DashboardRepository @Inject constructor(
     private val callLogReader: CallLogReader,
     private val agentsApi: AgentsApi,
     private val session: SessionManager,
+    // Only for the agent's voicemail marks: the Dashboard computes from the device call log, but that
+    // log can't express "reached a machine", so the marks have to come from here.
+    private val callDao: CallDao,
 ) {
 
     /** yyyy-MM-dd of the day we last successfully pushed "Present"; guards against re-pushing every refresh. */
@@ -373,7 +460,9 @@ class DashboardRepository @Inject constructor(
         }.timeInMillis
 
         // --- Stage 1: local-only (no network) ---
-        val allCalls = callLogReader.readAll()
+        // Marks are re-applied on every compute, because this reads the raw call log rather than the
+        // `calls` table — the log itself cannot record that a call reached a machine.
+        val allCalls = callLogReader.readAll().withVoicemailMarks(callDao.getVoicemailMarkedIds())
         val leads = leadDao.getAllLeads().first()
 
         // Per-number assignment cutoff (earliest stamp wins if a number is shared; null =
@@ -453,21 +542,28 @@ class DashboardRepository @Inject constructor(
             .filter { it.dateMillis in startOfDay until endOfDay }
             .sortedBy { it.dateMillis }
 
-        // Idle time = the gap between the two most recent calls today only. No synthetic "now"
-        // marker (that inflated idle with time-since-last-call, which read as login time), and
-        // no cross-day carryover. Fewer than two calls today -> no idle to show.
-        val idleSeconds = if (today.size >= 2) computeIdleSeconds(today.takeLast(2)) else null
+        // Idle = how long the agent has been off the phone right now: last call ended → now.
+        val idleSeconds = idleSecondsSinceLastCall(today, nowMillis)
 
-        val totalTalk = today.sumOf { it.durationSeconds }
+        // Talk time, not raw duration: a voicemail carries a real length but was never answered, so
+        // it must not be credited as time the agent spent talking. See `talkTimeSeconds`.
+        val totalTalk = today.sumOf { it.talkTimeSeconds }
         // Dials include answered inbound calls, not just outgoing ones — see `countsAsDial` for the
         // rule. Counting outgoing alone was what made this tile report 2 against the web historical
         // report's 5 for the same day.
         val dials = today.count { it.countsAsDial }
         // Connected is a subset of the dialled calls, so it can never print higher than Total Dial.
-        val connected = today.count { it.countsAsDial && it.durationSeconds > 0 }
+        // Uses countsAsConnected, so an agent-marked voicemail drops out of this too — it kept a
+        // duration but reached a machine. The dial itself still counts; the agent did place the call.
+        val connected = today.count { it.countsAsConnected }
         val callsPerNumber = today.groupingBy { it.number.normalizedPhoneKey() }.eachCount()
         val unique = callsPerNumber.size
-        val callMoreThan = callsPerNumber.count { it.value >= 2 }
+        // "Call more than 5 min" — counts individual long calls by duration, matching the backend's
+        // `longCalls` metric (GET api/calls/long-calls, ≥ LONG_CALL_THRESHOLD_SECONDS) so this tile and
+        // the web historical report agree. It previously counted *numbers dialled twice or more*, which
+        // measured repeat attempts rather than call length and disagreed with the server for the same
+        // day. Uses talkTimeSeconds, so a long voicemail recording is not a long call.
+        val callMoreThan = today.count { it.talkTimeSeconds >= LONG_CALL_THRESHOLD_SECONDS }
 
         return DashboardStats(
             date = formatDashboardDate(startOfDay),
@@ -522,7 +618,9 @@ class DashboardRepository @Inject constructor(
 @Singleton
 class LeadsRepository @Inject constructor(
     private val leadsApi: LeadsApi,
+    private val bookingsApi: BookingsApi,
     private val uploadApi: UploadApi,
+    private val cloudinaryApi: CloudinaryApi,
     private val documentPartFactory: DocumentPartFactory,
     private val leadDao: LeadDao,
     private val noteDao: NoteDao,
@@ -573,7 +671,6 @@ class LeadsRepository @Inject constructor(
         // Durable due dates, read once. These outlive the `leads` table, so this is what puts a
         // saved reminder back after a destructive migration wiped the row it used to live in.
         val savedDueDates = dueDateStore.all()
-        val now = System.currentTimeMillis()
         val entities = dtos.map { dto ->
             val entity = dto.toEntity()
             val prior = existing[entity.id]
@@ -600,9 +697,24 @@ class LeadsRepository @Inject constructor(
                 // server response and wiped every edit within seconds of saving it.
                 travelDate = entity.travelDate ?: prior?.travelDate,
                 numberOfPersons = entity.numberOfPersons ?: prior?.numberOfPersons,
-                // Set once: stamp the first time this lead appears for this agent, then preserve.
-                // This instant is the call-log cutoff — calls before it aren't this agent's work.
-                assignedAt = prior?.assignedAt ?: now,
+                // Call-log cutoff: calls before this instant aren't this agent's work.
+                //
+                // Sourced from the server's `createdAt`, NOT from the moment this lead was first seen
+                // on this device. Room uses fallbackToDestructiveMigration(), so a first-sight stamp
+                // was re-set to "now" on every schema bump and every reinstall — which moved the
+                // cutoff forward and made the lead's entire call history disappear from the detail
+                // screen. `createdAt` comes from the payload, so it survives both.
+                //
+                // The backend exposes no assignment date (ApiLeadDto has createdAt/updatedAt only),
+                // so creation is the proxy. It can be earlier than the real assignment, which is
+                // harmless here: calls made before this agent held the lead were made by someone
+                // else on another device and so aren't in this device's call log at all.
+                //
+                // Takes the EARLIEST of stored and incoming, unlike the server-wins precedence used
+                // for the fields above. This cutoff may only ever move backwards — `createdAt`
+                // degrades to `now` when the server omits it (Models.kt `toEpochMillisOrNow`), and
+                // letting that overwrite an earlier stored stamp would hide history all over again.
+                assignedAt = listOfNotNull(prior?.assignedAt, entity.createdAt).min(),
             )
         }
 
@@ -705,24 +817,135 @@ class LeadsRepository @Inject constructor(
         noteDao.replaceServerNotes(leadId, apiNotes.map { it.toEntity(leadId) })
     }
 
+    /**
+     * Attaches a file to a lead by uploading it, then writing a note that carries the resulting URL.
+     *
+     * The upload goes **straight to Cloudinary**, in three hops: ask our backend to sign a set of
+     * upload parameters, POST the file to Cloudinary with that signature, then note the `secure_url`
+     * it returns. The file never passes through our own API, which is the point — our host caps a
+     * request body at 4.5 MB, so routing a 10 MB attachment through it could not work regardless of
+     * timeouts. It also means one network hop instead of two.
+     *
+     * Only the transport changed. The note-writing half is untouched: [addNote] still owns the
+     * optimistic Room insert and its rollback, so an attachment that fails to attach leaves no
+     * phantom note behind.
+     */
     suspend fun uploadDocument(leadId: String, uri: Uri): Result<String> = runCatching {
         val token = session.getToken()?.toBearerOrNull()
             ?: error("Not logged in — cannot upload.")
         val (part, meta) = documentPartFactory.build(uri)
             ?: error("Couldn't read the selected file.")
 
+        // The same id has to reach the backend (to be signed) and Cloudinary (as a form field), so it
+        // is generated once here rather than derived twice from the file name.
+        val publicId = cloudinaryPublicId(meta.fileName)
+        val signature = requestUploadSignature(token, publicId)
+
+        val fileUrl = if (signature != null) {
+            uploadToCloudinary(part, signature)
+        } else {
+            // Older backend without api/upload/signature — see legacyUpload.
+            legacyUpload(token, part)
+        }
+
+        addNote(leadId, text = meta.fileName, imageUrl = fileUrl).getOrThrow()
+        fileUrl
+    }
+
+    /**
+     * Fetches signed Cloudinary credentials, or returns null when this backend has no such endpoint.
+     *
+     * Null means "not deployed here", and only that: a 404/405/501 is the shape of a route that does
+     * not exist. Every other failure is reported, because they are all things the agent or the
+     * backend team needs to see rather than silently work around — a 401 means the session expired
+     * (the legacy path would reject it too), and a 500 means the backend is missing its Cloudinary
+     * credentials, which no amount of client retrying fixes.
+     */
+    private suspend fun requestUploadSignature(
+        token: String,
+        publicId: String,
+    ): UploadSignatureDto? {
+        val response = uploadApi.uploadSignature(authorization = token, publicId = publicId)
+        if (!response.isSuccessful) {
+            if (response.code() in ENDPOINT_ABSENT_CODES) {
+                Log.i(TAG, "No api/upload/signature (HTTP ${response.code()}); using legacy upload.")
+                return null
+            }
+            val serverMessage = parseSignatureError(response.errorBody()?.string())
+            error(serverMessage ?: "Couldn't prepare the upload (HTTP ${response.code()}).")
+        }
+        val body = response.body()
+            ?: error("Couldn't prepare the upload — the server sent an empty response.")
+
+        // Validated together rather than defaulted individually: a signature is only usable if every
+        // part of it arrived, and Cloudinary's reply to a partial one is an opaque 401.
+        if (body.signature.isNullOrBlank() ||
+            body.apiKey.isNullOrBlank() ||
+            body.cloudName.isNullOrBlank() ||
+            body.timestamp == null
+        ) {
+            error(
+                body.error?.takeIf { it.isNotBlank() }
+                    ?: body.message?.takeIf { it.isNotBlank() }
+                    ?: "Couldn't prepare the upload — the server sent incomplete credentials."
+            )
+        }
+        return body
+    }
+
+    /**
+     * Posts the file to Cloudinary with the signed parameters and returns its `secure_url`.
+     *
+     * The form fields are built from what the signature response actually contained, never from what
+     * we asked for. Cloudinary recomputes the signature over the exact parameters it receives, so a
+     * field the backend did not sign — even a correct-looking one — fails the upload wholesale with
+     * "Invalid Signature" rather than being ignored.
+     */
+    private suspend fun uploadToCloudinary(
+        part: MultipartBody.Part,
+        signature: UploadSignatureDto,
+    ): String {
+        val fields = buildMap {
+            put("api_key", signature.apiKey!!.toFormField())
+            put("timestamp", signature.timestamp!!.toString().toFormField())
+            put("signature", signature.signature!!.toFormField())
+            signature.folder?.takeIf { it.isNotBlank() }?.let { put("folder", it.toFormField()) }
+            signature.publicId?.takeIf { it.isNotBlank() }?.let { put("public_id", it.toFormField()) }
+        }
+
+        val response = cloudinaryApi.upload(
+            url = "$CLOUDINARY_UPLOAD_BASE/${signature.cloudName}/auto/upload",
+            file = part,
+            fields = fields,
+        )
+        if (!response.isSuccessful) {
+            val message = parseCloudinaryError(response.errorBody()?.string())
+            error(cloudinaryFailureMessage(message, response.code()))
+        }
+        val body = response.body()
+        return body?.secureUrl?.takeIf { it.isNotBlank() }
+            ?: error(
+                cloudinaryFailureMessage(body?.error?.message, response.code())
+            )
+    }
+
+    /**
+     * The previous transport: multipart to our own `api/upload`, which relayed to Cloudinary.
+     *
+     * Retained only so a build running against a backend that predates the signature endpoint still
+     * uploads. It inherits that host's 4.5 MB body limit, so a file between that and our 10 MB cap
+     * will fail here with the server's own error — correctly, and with a message from the server
+     * rather than a mystery timeout.
+     */
+    private suspend fun legacyUpload(token: String, part: MultipartBody.Part): String {
         val response = uploadApi.upload(authorization = token, file = part)
         if (!response.isSuccessful) {
-
             val serverMessage = parseUploadError(response.errorBody()?.string())
             error(serverMessage ?: "Upload failed (HTTP ${response.code()}).")
         }
         val body = response.body()
-        val fileUrl = body?.fileUrl?.takeIf { it.isNotBlank() }
+        return body?.fileUrl?.takeIf { it.isNotBlank() }
             ?: error(body?.error ?: body?.message ?: "Upload failed — no file URL returned.")
-
-        addNote(leadId, text = meta.fileName, imageUrl = fileUrl).getOrThrow()
-        fileUrl
     }
 
     /**
@@ -838,7 +1061,11 @@ class LeadsRepository @Inject constructor(
     }
 
     /**
-     * Submits the agent's booking form to `PUT api/leads/{id}/book`, then records `Booked` locally.
+     * Creates the booking record via `POST api/bookings`, then records `Booked` locally.
+     *
+     * The multipart body carries the form's text fields plus the transaction screenshot, and a
+     * `leadId` — that last field is what makes the backend sync this lead to `Booked`, and it is the
+     * only link between the booking database (`ft_booking_system`) and the CRM lead.
      *
      * **Server-first, unlike every other write here.** Leads and notes are offline-first — write Room,
      * push, let a failed push reconcile later — but booking can't be: reaching `Booked` locks the
@@ -846,20 +1073,42 @@ class LeadsRepository @Inject constructor(
      * push would leave the lead locked with no booking on the server and no way for the agent to
      * retry. So nothing is written until the server has the booking.
      *
-     * The response DTO is intentionally **not** upserted: it carries no `assignedAt` and its
-     * `dates.reminderDate` round-trip would risk the local-only reminder, both of which
-     * [syncLeads] guards. The next sync picks up the `name`/`product` the backend rewrites from
-     * `fullName`/`packageName`.
+     * The local status write is kept rather than left to the next sync: it's what closes the dialog on
+     * a lead the UI already shows, and it stays correct even if the backend's lead-sync step is the
+     * part that failed.
+     *
+     * Note this no longer calls `PUT api/leads/{id}/book`. That endpoint also incremented the agent's
+     * monthly booking count and rewrote the lead's `name`/`product` from the form — neither of which
+     * `POST api/bookings` does, so those two side effects no longer happen on booking.
      */
-    suspend fun bookLead(leadId: String, form: BookingForm): Result<Unit> = runCatching {
+    suspend fun bookLead(leadId: String, form: BookingForm): Result<BookingReceipt> = runCatching {
         val token = session.getToken()?.takeIf { it.isNotBlank() }
             ?: error("Not logged in — cannot book this lead.")
 
-        leadsApi.bookLead(
-            id = leadId,
+        val screenshotUri = form.screenshotUri?.takeIf { it.isNotBlank() }
+            ?: error("Attach the transaction screenshot before booking.")
+
+        // Throws with an agent-readable message if the file is too big or the wrong type; returns null
+        // only when the URI can't be opened, which usually means the picker's grant already lapsed.
+        val (screenshotPart, _) = documentPartFactory.buildScreenshot(Uri.parse(screenshotUri))
+            ?: error("Couldn't read the selected screenshot. Please pick it again.")
+
+        val response = bookingsApi.createBooking(
             authorization = token.toBearerOrNull(),
-            body = form.toRequest(),
+            fields = form.toFormFields(leadId).mapValues { (_, value) -> value.toFormField() },
+            screenshot = screenshotPart,
         )
+        if (!response.isSuccessful) {
+            error(
+                parseBookingError(response.errorBody()?.string())
+                    ?: friendlyBookingFailure(response.code())
+            )
+        }
+        val booking = response.body()?.data
+            ?: error(
+                response.body()?.error?.takeIf { it.isNotBlank() }
+                    ?: "The booking may not have been saved — the server sent an empty response."
+            )
 
         val now = System.currentTimeMillis()
         val previousStatus = leadDao.getLeadById(leadId)?.status
@@ -876,7 +1125,16 @@ class LeadsRepository @Inject constructor(
                 )
             )
         }
-        Unit
+
+        BookingReceipt(
+            bookingId = booking.bookingId?.takeIf { it.isNotBlank() },
+            // Server-derived, and deliberately read back rather than echoed from the form: the backend
+            // recalculates paid from *verified* payments, so a deposit that's still awaiting
+            // verification legitimately reads as 0 here.
+            totalAmount = booking.totalAmount,
+            paidAmount = booking.paidAmount,
+            dueAmount = booking.dueAmount,
+        )
     }.mapApiError()
 
     suspend fun updateBooking(leadId: String, calls: List<CallLogEntry>): Result<Unit> = runCatching {
@@ -924,6 +1182,18 @@ class LeadsRepository @Inject constructor(
     private companion object {
         /** Skip a network sync if the last one finished within this window (unless forced). */
         const val SYNC_THROTTLE_MS = 30_000L
+
+        const val TAG = "LeadsRepo"
+
+        const val CLOUDINARY_UPLOAD_BASE = "https://api.cloudinary.com/v1_1"
+
+        /**
+         * Responses that mean "this route isn't deployed here" rather than "the request was bad".
+         *
+         * 405 and 501 are included alongside 404 because a host that routes every `api` path to one
+         * handler can answer an unknown sub-path with a method error instead of a not-found.
+         */
+        val ENDPOINT_ABSENT_CODES = setOf(404, 405, 501)
     }
 }
 
@@ -1142,6 +1412,7 @@ class CallLogSyncRepository @Inject constructor(
     private val callSyncStore: CallSyncStore,
     private val session: SessionManager,
     private val leadDao: LeadDao,
+    private val callDao: CallDao,
 ) {
 
     // Serializes syncNewCalls. The call-log observer fires it repeatedly for one call (Android
@@ -1149,6 +1420,181 @@ class CallLogSyncRepository @Inject constructor(
     // same old watermark before either advanced it — and POST the same call twice, inflating the
     // backend's COUNT(*)-based totalDials. The lock makes each run see the prior run's watermark.
     private val syncMutex = Mutex()
+
+    /**
+     * A lead's stored call history, newest first, as a live Flow — the screen's source of truth.
+     *
+     * Reading from Room rather than the call-log provider is what makes history survive closing the
+     * dialog, leaving the screen, an app restart and being offline; it also updates on its own as
+     * [ingestDeviceCalls] writes new rows, so the UI needs no refresh call of its own.
+     *
+     * [since] is the lead's `assignedAt` cutoff — calls before it belong to a prior owner. Null means
+     * no restriction, matching the maps in [leadIndex].
+     */
+    fun observeCallsForLead(phone: String, since: Long?): Flow<List<CallLogEntry>> {
+        val key = phone.normalizedPhoneKey()
+        if (key.isEmpty()) return flowOf(emptyList())
+        return callDao.observeCallsForNumber(key, since ?: 0L)
+            .map { rows -> rows.map { it.toDomain() } }
+    }
+
+    /**
+     * Fills a lead's history from `GET api/calls/long-calls` when this device has nothing stored for
+     * it — the fresh-install and new-device case, where the call log holds none of the agent's earlier
+     * calls but the backend does.
+     *
+     * Returns 0 and makes no request when rows already exist, so this never competes with the device
+     * log. That is the intended precedence: the device is the complete source (it has missed and
+     * failed calls too), the server is the fallback.
+     *
+     * **Known gaps, both inherent to the endpoint rather than incidental:**
+     * - `metric` accepts only `connected` or `longCalls` (≥300s), so **missed and failed calls cannot
+     *   be recovered from the server at all**. A backfilled history is therefore answered calls only.
+     *   `connected` is requested because long calls are a subset of it.
+     * - `LongCallDto` carries no `clientCallId`, so server rows can't be matched to device rows by id.
+     *   Overlap is suppressed by number + instant within [SERVER_CALL_DEDUPE_TOLERANCE_MS]; a device
+     *   row that lands later for the same call can still duplicate a backfilled one, which is why this
+     *   only ever runs into an empty history.
+     */
+    suspend fun backfillCallsForLead(
+        phone: String,
+        leadId: String?,
+        since: Long?,
+    ): Result<Int> = runCatching {
+        val key = phone.normalizedPhoneKey()
+        if (key.isEmpty()) return@runCatching 0
+        val cutoff = since ?: 0L
+        if (callDao.countForNumber(key, cutoff) > 0) return@runCatching 0
+
+        val rows = callsApi.getLongCalls(
+            authorization = bearerOrThrow(),
+            metric = "connected",
+        )
+        // The endpoint is agent-scoped by the token but not number-scoped, so filter to this lead.
+        val existing = callDao.getCallsForNumber(key, 0L)
+        val entities = rows
+            .mapNotNull { it.toEntity(fallbackLeadId = leadId) }
+            .filter { it.phoneKey == key && it.dateMillis >= cutoff }
+            .filter { candidate ->
+                existing.none { stored ->
+                    abs(stored.dateMillis - candidate.dateMillis) <= SERVER_CALL_DEDUPE_TOLERANCE_MS
+                }
+            }
+        if (entities.isEmpty()) return@runCatching 0
+        callDao.replaceServerCalls(key, entities)
+        entities.size
+    }.mapApiError()
+
+    /**
+     * Marks (or unmarks) one call as having reached a voicemail machine rather than a person.
+     *
+     * The agent is the only possible source for this: Android's call log records an answered machine
+     * exactly like an answered human. Applies to a single call, never to the number — the same lead can
+     * go to voicemail once and pick up the next time.
+     *
+     * Takes effect immediately everywhere, because the write lands in the `calls` table that the lead
+     * screen observes and the Dashboard re-reads marks from on every compute. The call's talk time and
+     * its connected status drop; the dial still counts, since the agent did place it.
+     *
+     * Only device-sourced calls can be marked — [CallEntity.id] is recoverable from a device row's
+     * numeric id, whereas a server-backfilled row's domain id is synthetic. Returns false for those
+     * rather than writing to a guessed id.
+     */
+    suspend fun setCallVoicemail(call: CallLogEntry, isVoicemail: Boolean): Result<Boolean> =
+        runCatching {
+            if (call.id < 0) return@runCatching false
+            callDao.setVoicemail(deviceCallId(call.id), isVoicemail)
+            true
+        }
+
+    /** One-shot read of the same rows [observeCallsForLead] streams. */
+    suspend fun getStoredCallsForLead(phone: String, since: Long?): List<CallLogEntry> {
+        val key = phone.normalizedPhoneKey().ifEmpty { return emptyList() }
+        return callDao.getCallsForNumber(key, since ?: 0L).map { it.toDomain() }
+    }
+
+    /**
+     * Mirrors this device's call log into the `calls` table so a lead's history is stored locally
+     * instead of being re-read from the provider every time the dialog opens.
+     *
+     * Deliberately **not** bounded by the watermark or by [REPORTING_LOOKBACK_DAYS], unlike
+     * [syncNewCalls]: those bounds exist to keep the *backend's* dial counts honest, whereas this is
+     * the agent's full local history — every call to an assigned lead from that lead's `assignedAt`
+     * onward, however old. The upsert is keyed on the device call-log id, so re-ingesting the same
+     * row corrects a duration that settled after the first read rather than duplicating the call.
+     *
+     * Calls to a number with no assigned lead are skipped rather than stored unattributed — this
+     * table must not accumulate the agent's personal and spam calls. That does **not** lose a call
+     * placed before its lead had synced: because this re-reads the entire log rather than resuming
+     * from a cursor, the next run after the lead lands picks that call up and stores it. Re-reading
+     * everything is therefore load-bearing, not just simpler. [CallDao.attachLeadId] then covers the
+     * residual case of rows already stored against a lead whose id changed.
+     */
+    suspend fun ingestDeviceCalls(): Result<Int> = runCatching {
+        if (!callLogReader.hasPermission()) return@runCatching 0
+        val all = callLogReader.readAll()
+        if (all.isEmpty()) return@runCatching 0
+
+        val leads = leadDao.getAllLeads().first()
+        val index = leadIndex(leads)
+        if (index.assignedByKey.isEmpty()) return@runCatching 0
+
+        // Read the agent's voicemail marks BEFORE building the rows. The device log has no such field,
+        // so this table is their only copy — upserting without carrying them forward would silently
+        // erase every mark on the next call-log change.
+        val voicemailMarked = deviceCallLogIds(callDao.getVoicemailMarkedIds())
+
+        val entities = all.mapNotNull { entry ->
+            val key = entry.number.normalizedPhoneKey().ifEmpty { null } ?: return@mapNotNull null
+            if (!index.assignedByKey.containsKey(key)) return@mapNotNull null
+            // Same cutoff the backend push uses: a null stamp means no restriction.
+            val assignedAt = index.assignedByKey[key]
+            if (assignedAt != null && entry.dateMillis < assignedAt) return@mapNotNull null
+            entry.toEntity(
+                leadId = index.leadIdByKey[key],
+                isVoicemail = entry.id in voicemailMarked,
+            )
+        }
+        if (entities.isEmpty()) return@runCatching 0
+
+        callDao.upsertCalls(entities)
+        // Adopt rows stored before their lead existed locally.
+        leads.forEach { lead ->
+            val key = lead.phone.normalizedPhoneKey()
+            if (key.isNotEmpty()) callDao.attachLeadId(key, lead.id)
+        }
+        entities.size
+    }
+
+    /**
+     * Phone-key views of the agent's leads, shared by [ingestDeviceCalls] and [syncNewCalls] so the
+     * two can't disagree about which calls belong to a lead.
+     *
+     * Both maps key off the last-10-digit phone key. When several leads share a number the earliest
+     * assignment wins, which is the most inclusive choice; a null stamp means "no restriction".
+     */
+    private fun leadIndex(leads: List<LeadEntity>): LeadCallIndex {
+        val assignedByKey: Map<String, Long?> = leads
+            .mapNotNull { lead ->
+                val key = lead.phone.normalizedPhoneKey().ifEmpty { null } ?: return@mapNotNull null
+                key to lead.assignedAt
+            }
+            .groupBy({ it.first }, { it.second })
+            .mapValues { (_, times) -> if (times.any { it == null }) null else times.filterNotNull().min() }
+        val leadIdByKey: Map<String, String> = leads
+            .mapNotNull { lead ->
+                val key = lead.phone.normalizedPhoneKey().ifEmpty { null } ?: return@mapNotNull null
+                Triple(key, lead.id, lead.assignedAt)
+            }
+            .groupBy { it.first }
+            .mapValues { (_, rows) -> rows.minBy { it.third ?: Long.MAX_VALUE }.second }
+        return LeadCallIndex(assignedByKey, leadIdByKey)
+    }
+
+    private data class LeadCallIndex(
+        val assignedByKey: Map<String, Long?>,
+        val leadIdByKey: Map<String, String>,
+    )
 
     suspend fun syncNewCalls(): Result<Int> = syncMutex.withLock {
       runCatching {
@@ -1164,30 +1610,15 @@ class CallLogSyncRepository @Inject constructor(
             return@runCatching 0
         }
 
-        // Only post calls that (a) happened today and (b) are to an assigned lead. The backend
-        // counts every posted call as a "dial", so sending the agent's whole call history
-        // (incoming/spam/non-lead + past days) inflated the Historical report. Non-qualifying
-        // calls still advance the watermark so they're never reprocessed.
-        // Per-number assignment cutoff: a call only counts if it happened at/after the lead was
-        // assigned to this agent. Keyed by last-10-digit phone key; if several leads share a number
-        // the earliest stamp wins (most inclusive). A null stamp means "no restriction".
+        // Only post calls that (a) fall in the reporting window and (b) are to an assigned lead, at or
+        // after that lead's assignment cutoff. The backend counts every posted call as a "dial", so
+        // sending the agent's whole call history (incoming/spam/non-lead + past days) inflated the
+        // Historical report. Shares `leadIndex` with ingestDeviceCalls so the two agree on which
+        // calls belong to a lead.
         val leads = leadDao.getAllLeads().first()
-        val assignedByKey: Map<String, Long?> = leads
-            .mapNotNull { lead ->
-                val key = lead.phone.normalizedPhoneKey().ifEmpty { null } ?: return@mapNotNull null
-                key to lead.assignedAt
-            }
-            .groupBy({ it.first }, { it.second })
-            .mapValues { (_, times) -> if (times.any { it == null }) null else times.filterNotNull().min() }
-        // Phone key -> lead id, so a logged call can be tied to its lead. When several leads share a
-        // number, prefer the earliest-assigned (matches the most-inclusive cutoff in assignedByKey).
-        val leadIdByKey: Map<String, String> = leads
-            .mapNotNull { lead ->
-                val key = lead.phone.normalizedPhoneKey().ifEmpty { null } ?: return@mapNotNull null
-                Triple(key, lead.id, lead.assignedAt)
-            }
-            .groupBy { it.first }
-            .mapValues { (_, rows) -> rows.minBy { it.third ?: Long.MAX_VALUE }.second }
+        val index = leadIndex(leads)
+        val assignedByKey = index.assignedByKey
+        val leadIdByKey = index.leadIdByKey
         // Stable per-install id; combined with the device call-log id it makes clientCallId
         // deterministic, so a retried POST can't create a duplicate row (guide: idempotency).
         val installId = callSyncStore.getInstallId()
@@ -1200,29 +1631,51 @@ class CallLogSyncRepository @Inject constructor(
         val windowStart = startOfDayMillis(now) - (REPORTING_LOOKBACK_DAYS - 1) * DAY_MS
         val windowEnd = startOfDayMillis(now) + DAY_MS
 
+        // The watermark means "examined up to here"; the pending set means "examined but still owed to
+        // the server". Splitting the two is what stopped calls from being destroyed: previously a
+        // single cursor was advanced past every non-qualifying call, so "skipped because its lead
+        // hadn't synced yet" was indistinguishable from "already sent" and the call was never
+        // reconsidered. Candidates are therefore everything new plus everything still owed.
         val watermark = callSyncStore.getWatermark()
-        val newCalls = all.filter { it.id > watermark }.sortedBy { it.id }
-        if (newCalls.isEmpty()) return@runCatching 0
+        val pending = callSyncStore.getPending().toMutableSet()
+        // Drop owed ids whose row has left the device log (the agent cleared their call history).
+        // Nothing in the loop below can reach them — they aren't in `all`, so they never become
+        // candidates — and without this they would sit in the set until MAX_PENDING evicted them.
+        // Runs before the early return below, which would otherwise skip the prune for good.
+        val deviceIds = all.mapTo(HashSet()) { it.id }
+        if (pending.retainAll(deviceIds)) callSyncStore.setPending(pending)
+
+        val candidates = all.filter { it.id > watermark || it.id in pending }.sortedBy { it.id }
+        if (candidates.isEmpty()) return@runCatching 0
 
         var logged = 0
-        for (entry in newCalls) {
-            val status = callStatusFor(entry)
-
-            // Stop before a row whose duration is still in flux (see [isDurationUnsettled]). Break,
-            // not continue, so the watermark stays behind it and the next sync re-reads it with the
-            // settled duration. Rows are ascending by id, so everything after this is newer still.
-            if (isDurationUnsettled(entry, now)) break
-
+        var seenUpTo = watermark
+        for (entry in candidates) {
             val key = entry.number.normalizedPhoneKey()
-            val isInWindow = entry.dateMillis in windowStart until windowEnd
-            val isLeadCall = assignedByKey.containsKey(key)
-            // Exclude calls before the lead was assigned to this agent (a prior owner's history).
-            val assignedAt = assignedByKey[key]
-            val afterAssignment = assignedAt == null || entry.dateMillis >= assignedAt
-            if (status == null || !isInWindow || !isLeadCall || !afterAssignment) {
-                callSyncStore.setWatermark(entry.id)
-                continue
+            val action = callSyncAction(
+                entry = entry,
+                now = now,
+                windowStart = windowStart,
+                windowEnd = windowEnd,
+                assignedAt = assignedByKey[key],
+                isLeadCall = assignedByKey.containsKey(key),
+            )
+            // Every branch advances `seenUpTo`: the watermark records what was examined, while
+            // `pending` separately records what is still owed.
+            seenUpTo = maxOf(seenUpTo, entry.id)
+            when (action) {
+                CallSyncAction.DISCARD -> {
+                    pending.remove(entry.id)
+                    continue
+                }
+                CallSyncAction.RETRY_LATER -> {
+                    pending.add(entry.id)
+                    continue
+                }
+                CallSyncAction.POST -> Unit
             }
+            // Non-null for POST — callSyncAction discards a row without an acceptable status.
+            val status = callStatusFor(entry) ?: continue
             val response = callsApi.logCall(
                 authorization = bearer,
                 body = LogCallRequest(
@@ -1242,17 +1695,26 @@ class CallLogSyncRepository @Inject constructor(
             )
 
             if (!response.isSuccessful) {
-                // A permanent rejection (duplicate clientCallId, malformed body) will fail
-                // identically forever. Advancing past it keeps one poison row from blocking every
-                // newer call behind it — which would silently freeze all reporting. Transient
-                // failures (5xx, auth, throttling) stop the run so the calls are retried intact.
-                if (!isPermanentCallLogError(response.code())) break
-                callSyncStore.setWatermark(entry.id)
-                continue
+                if (isPermanentCallLogError(response.code())) {
+                    // A body-level rejection (duplicate clientCallId, malformed body) fails
+                    // identically forever, so stop owing it — otherwise one poison row would be
+                    // retried on every sync for as long as it stayed in the window.
+                    pending.remove(entry.id)
+                    continue
+                }
+                // Transient (5xx, auth, throttling): keep it owed and end the run rather than
+                // hammering the server once per remaining call. Everything examined so far is still
+                // persisted below, so the break costs nothing but the retry.
+                pending.add(entry.id)
+                break
             }
-            callSyncStore.setWatermark(entry.id)
+            pending.remove(entry.id)
             logged++
         }
+        // Persisted once, after the loop, so an early break still records everything examined. The
+        // watermark only ever moves forward over rows this run actually looked at.
+        if (seenUpTo > watermark) callSyncStore.setWatermark(seenUpTo)
+        callSyncStore.setPending(pending)
         logged
       }
     }
@@ -1323,6 +1785,57 @@ class CallLogSyncRepository @Inject constructor(
  */
 fun isPermanentCallLogError(code: Int): Boolean = code == 400 || code == 409 || code == 422
 
+/** What [CallLogSyncRepository.syncNewCalls] should do with one device call-log row. */
+enum class CallSyncAction {
+    /** Send it now. */
+    POST,
+
+    /** Not eligible yet, but could be later — keep it owed and reconsider on a future run. */
+    RETRY_LATER,
+
+    /** Can never be posted; stop tracking it. */
+    DISCARD,
+}
+
+/**
+ * Decides the fate of one call-log row, kept as a pure function so the three-way split is testable
+ * without a Retrofit/DataStore/ContentProvider stack (this project has JUnit only — no MockK).
+ *
+ * The distinction between [CallSyncAction.RETRY_LATER] and [CallSyncAction.DISCARD] is the whole
+ * point: a single "seen" cursor used to collapse them, so a call skipped because its lead hadn't
+ * synced yet was treated exactly like one already sent, and was silently lost.
+ *
+ * [assignedAt] is the lead's cutoff (null = no restriction) and [isLeadCall] whether the number
+ * belongs to an assigned lead at all.
+ */
+fun callSyncAction(
+    entry: CallLogEntry,
+    now: Long,
+    windowStart: Long,
+    windowEnd: Long,
+    assignedAt: Long?,
+    isLeadCall: Boolean,
+): CallSyncAction {
+    // No status the backend's enum accepts (blocked/unknown), so it is unpostable by nature.
+    if (callStatusFor(entry) == null) return CallSyncAction.DISCARD
+    // Older than the reporting window, which only ever moves forward — it can never re-enter. This is
+    // also what bounds the pending set: an id that never becomes eligible ages out instead of
+    // accumulating forever.
+    if (entry.dateMillis < windowStart) return CallSyncAction.DISCARD
+
+    // The lead may still arrive (a call placed moments after adding a lead syncs later), and the
+    // cutoff itself can still move backwards because it takes the earliest value ever seen.
+    if (!isLeadCall) return CallSyncAction.RETRY_LATER
+    if (assignedAt != null && entry.dateMillis < assignedAt) return CallSyncAction.RETRY_LATER
+    // Stamped beyond the window's upper bound (skewed device clock). Comes back into range as the
+    // bound advances, so it waits rather than being discarded.
+    if (entry.dateMillis >= windowEnd) return CallSyncAction.RETRY_LATER
+    // Duration still being written; posting now would record a real call as zero-length.
+    if (isDurationUnsettled(entry, now)) return CallSyncAction.RETRY_LATER
+
+    return CallSyncAction.POST
+}
+
 /**
  * True when [value] can be cast to a MongoDB ObjectId — exactly 24 hex characters.
  *
@@ -1345,17 +1858,29 @@ fun callStatusFor(entry: CallLogEntry): String? = when (entry.type) {
 fun presentDayCount(calls: List<CallLogEntry>): Int =
     calls.map { formatApiDate(it.dateMillis) }.distinct().size
 
-fun computeIdleSeconds(callsOldestFirst: List<CallLogEntry>): Long {
-    if (callsOldestFirst.size < 2) return 0L
-    var idle = 0L
-    for (i in 0 until callsOldestFirst.size - 1) {
-        val current = callsOldestFirst[i]
-        val next = callsOldestFirst[i + 1]
-        val currentEndMs = current.dateMillis + current.durationSeconds * 1000
-        val gapSeconds = (next.dateMillis - currentEndMs) / 1000
-        if (gapSeconds > 0) idle += gapSeconds
-    }
-    return idle
+/**
+ * How long the agent has been off the phone **right now**: from the end of their most recent call
+ * today to [nowMillis]. This is the live "not calling" stretch the Dashboard's Idle Time tile shows.
+ *
+ * Replaces an earlier metric that summed the gaps *between* today's calls. That answered a different
+ * question — total downtime already accumulated — so the tile sat frozen at the same value while the
+ * agent stopped calling, which is exactly when idle should be climbing.
+ *
+ * Null when there are no calls today, so the tile reads "—" rather than implying an idle stretch that
+ * was never measured. Scoping to today is what keeps this honest: an agent who hasn't called since
+ * yesterday shows "—", not a huge overnight figure that really means "hasn't started yet" (the reason
+ * a previous version of this tile was accused of reporting login time).
+ *
+ * The end of a call is `dateMillis + talkTimeSeconds`, not raw duration, so a voicemail recording
+ * doesn't count as time on the phone — consistent with talk time. Clamped at 0, so a call in progress
+ * or a skewed device clock reads "0m" instead of a negative figure. Uses the latest end rather than
+ * the latest start, so a long call that began before a short one can't be treated as ending first.
+ */
+fun idleSecondsSinceLastCall(todaysCalls: List<CallLogEntry>, nowMillis: Long): Long? {
+    val lastCallEndMs = todaysCalls
+        .maxOfOrNull { it.dateMillis + it.talkTimeSeconds * 1000 }
+        ?: return null
+    return ((nowMillis - lastCallEndMs) / 1000).coerceAtLeast(0L)
 }
 
 fun bookingFromCalls(
@@ -1378,14 +1903,17 @@ fun bookingFromCalls(
         calls
     }.sortedBy { it.dateMillis }
     if (scoped.isEmpty()) return null
-    val talkSeconds = scoped.sumOf { it.durationSeconds }
+    // Excludes voicemail (see `talkTimeSeconds`), so the talk time pushed to the backend matches the
+    // dial and connected counts below, which already ignore it.
+    val talkSeconds = scoped.sumOf { it.talkTimeSeconds }
     // Same `countsAsDial` rule the Dashboard uses, which is what stops the lead card and lead detail
     // from printing a different dial count than the Dashboard for the very same calls.
     val dials = scoped.count { it.countsAsDial }
     return UpdateBookingRequest(
         totalDial = dials,
         dailyDial = dials,
-        connected = scoped.count { it.countsAsDial && it.durationSeconds > 0 },
+        // Excludes agent-marked voicemails, matching the Dashboard's Connected Calls tile.
+        connected = scoped.count { it.countsAsConnected },
         talkTime = formatTalkTimeClock(talkSeconds),
         dailyTalkTime = formatTalkTimeClock(talkSeconds),
         firstCall = scoped.first().dateMillis.let(::formatIso8601),
@@ -1403,12 +1931,32 @@ internal const val DAY_MS = 24L * 60 * 60 * 1000
 internal const val REPORTING_LOOKBACK_DAYS = 3L
 
 /**
+ * How far apart two calls to the same number may be and still be treated as the same call when
+ * backfilling from the server.
+ *
+ * Needed because `LongCallDto` carries no `clientCallId` (see [CallLogSyncRepository.backfillCallsForLead]),
+ * so a server row can only be matched to a stored one by number and instant. A minute absorbs the
+ * clock skew between the device stamp and the server's copy while staying far below the gap between
+ * two genuinely distinct calls to the same lead.
+ */
+internal const val SERVER_CALL_DEDUPE_TOLERANCE_MS = 60_000L
+
+/**
  * How recent a call-log row must be before we treat its `duration` as still in flux. Android writes
  * the row at call start and rewrites DURATION on hang-up, so a row younger than this may be an
  * in-progress call whose duration is 0. Posting that would record it as Failed/Missed with no talk
  * time, and the watermark would move past it before the real duration ever landed.
  */
 internal const val CALL_SETTLE_MS = 15_000L
+
+/**
+ * How long a single call must last to count as a "long call" — five minutes.
+ *
+ * Matches the backend's `longCalls` metric (`GET api/calls/long-calls` treats ≥300s as long, and uses
+ * it as that endpoint's default), so the Dashboard's "Call more than" tile and the web historical
+ * report count the same calls for the same day.
+ */
+const val LONG_CALL_THRESHOLD_SECONDS = 300L
 
 /**
  * True when [entry] is too fresh to trust its duration, so posting it now would send a wrong
@@ -1448,9 +1996,16 @@ fun datesFromCalls(calls: List<CallLogEntry>): UpdateDatesRequest? {
 
 val CALL_OUTCOME_LABELS = listOf("Dialed", "Connected")
 
+/**
+ * The lead's outcome label: "Connected" once any call actually reached a person, else "Dialed".
+ *
+ * Uses [countsAsConnected] rather than a raw duration check, so a call the agent marked as voicemail
+ * doesn't label the lead Connected. This label is pushed to the backend, so leaving it on raw duration
+ * would contradict the Connected Calls figure on both the app's dashboard and the web one.
+ */
 fun callLabelFor(calls: List<CallLogEntry>): String? {
     if (calls.isEmpty()) return null
-    return if (calls.any { it.durationSeconds > 0 }) "Connected" else "Dialed"
+    return if (calls.any { it.countsAsConnected }) "Connected" else "Dialed"
 }
 
 fun mergeLabels(existing: List<String>, callLabel: String?): List<String> {

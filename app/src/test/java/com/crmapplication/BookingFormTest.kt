@@ -1,9 +1,10 @@
 package com.crmapplication
 
 import com.crmapplication.LeadDetailVM.repository.BookingForm
-import com.crmapplication.LeadDetailVM.repository.toRequest
+import com.crmapplication.LeadDetailVM.repository.PaymentMode
+import com.crmapplication.LeadDetailVM.repository.toFormFields
+import com.crmapplication.LeadDetailVM.repository.toIndianMobileDigits
 import com.crmapplication.LeadDetailVM.repository.validate
-import com.google.gson.Gson
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -13,11 +14,13 @@ import org.junit.Test
 import java.util.Calendar
 
 /**
- * Guards the booking form (`PUT /api/leads/:id/book`).
+ * Guards the Add Booking form (`POST /api/bookings`).
  *
  * Worth testing despite being "just a form": submitting is the only route to `Booked`, and once a lead
  * is booked this app won't let the status change again. A validation hole therefore produces an
- * unfixable record — an empty booking, or a ₹0 trip, that the agent can't take back.
+ * unfixable record — an empty booking, or a ₹0 trip, that the agent can't take back. The wire-shape
+ * tests matter for a second reason: the field keys are the whole contract with the booking backend, and
+ * a typo'd key fails as a validation error about a field the agent *did* fill in.
  */
 class BookingFormTest {
 
@@ -33,13 +36,18 @@ class BookingFormTest {
         emailId = "john.doe@example.com",
         contactNumber = "9876543210",
         emergencyContactNumber = "9123456780",
+        adults = "2",
+        children = "0",
         packageName = "Bali Honeymoon Package",
-        noOfPax = "2",
+        location = "Ubud, Bali, Indonesia",
         startDateMillis = dateMillis(2026, 8, 15),
         endDateMillis = dateMillis(2026, 8, 20),
         totalAmount = "150000",
         paidAmount = "50000",
-        dueAmount = "100000",
+        transactionId = "TXN874291857",
+        paymentMode = PaymentMode.FT_HDFC,
+        screenshotUri = "content://media/external/images/1234",
+        screenshotName = "payment.png",
     )
 
     @Test
@@ -53,8 +61,9 @@ class BookingFormTest {
         assertFalse(errors.isValid)
         listOf(
             errors.fullName, errors.emailId, errors.contactNumber, errors.emergencyContactNumber,
-            errors.packageName, errors.noOfPax, errors.startDate, errors.endDate,
-            errors.totalAmount, errors.paidAmount, errors.dueAmount,
+            errors.adults, errors.children, errors.packageName, errors.location,
+            errors.startDate, errors.endDate, errors.totalAmount, errors.paidAmount,
+            errors.transactionId, errors.screenshot,
         ).forEach { assertNotNull("every blank field should report an error", it) }
     }
 
@@ -66,24 +75,57 @@ class BookingFormTest {
         assertNull(validForm().copy(emailId = "j.d+tag@sub.example.co.in").validate().emailId)
     }
 
+    /** The API's rule, and stricter than the old 10-15 digit range this form used to allow. */
     @Test
-    fun `phone numbers need 10 to 15 digits`() {
+    fun `phone must be 10 digits starting 6 to 9`() {
         assertNotNull(validForm().copy(contactNumber = "98765").validate().contactNumber)
-        assertNotNull(
-            validForm().copy(emergencyContactNumber = "1234567890123456").validate()
-                .emergencyContactNumber
-        )
-        // Formatting shouldn't matter — only the digits do.
+        assertNotNull(validForm().copy(contactNumber = "98765432109").validate().contactNumber)
+        assertNotNull(validForm().copy(contactNumber = "5876543210").validate().contactNumber)
+        assertNull(validForm().copy(contactNumber = "6876543210").validate().contactNumber)
+        assertNull(validForm().copy(contactNumber = "9876543210").validate().contactNumber)
+    }
+
+    /**
+     * The phone is pre-filled from the lead, which commonly stores a `+91` prefix. Without
+     * normalisation the form would open already invalid on a perfectly good number — so this is a
+     * usability guard, not just tidiness.
+     */
+    @Test
+    fun `a country code or formatting is normalised away`() {
+        assertEquals("9876543210", "+91 98765-43210".toIndianMobileDigits())
+        assertEquals("9876543210", "919876543210".toIndianMobileDigits())
+        assertEquals("9876543210", "09876543210".toIndianMobileDigits())
         assertNull(validForm().copy(contactNumber = "+91 98765-43210").validate().contactNumber)
     }
 
     /**
-     * The mockup pre-fills `0` for pax and both amounts. Those are the values most likely to be
-     * submitted untouched, so they're the ones that must not pass.
+     * The emergency number isn't sent to the booking API, so it keeps the looser rule — an agent
+     * should be able to record an international next-of-kin number.
      */
     @Test
-    fun `the mockup's zero defaults do not pass`() {
-        assertNotNull(validForm().copy(noOfPax = "0").validate().noOfPax)
+    fun `emergency contact allows an international number`() {
+        assertNull(
+            validForm().copy(emergencyContactNumber = "+1 415 555 0123").validate()
+                .emergencyContactNumber
+        )
+        assertNotNull(
+            validForm().copy(emergencyContactNumber = "12345").validate().emergencyContactNumber
+        )
+    }
+
+    @Test
+    fun `children may be zero but the party may not be empty`() {
+        assertNull(validForm().copy(adults = "2", children = "0").validate().children)
+        assertNotNull(validForm().copy(adults = "0", children = "0").validate().adults)
+        assertNull(validForm().copy(adults = "0", children = "1").validate().adults)
+    }
+
+    /**
+     * The mockup pre-fills `0` for the amounts. Those are the values most likely to be submitted
+     * untouched, so they're the ones that must not pass.
+     */
+    @Test
+    fun `a zero total does not pass`() {
         assertNotNull(validForm().copy(totalAmount = "0").validate().totalAmount)
     }
 
@@ -95,10 +137,21 @@ class BookingFormTest {
 
     @Test
     fun `a fully paid booking is allowed`() {
-        val errors = validForm()
-            .copy(totalAmount = "150000", paidAmount = "150000", dueAmount = "0")
-            .validate()
+        val errors = validForm().copy(totalAmount = "150000", paidAmount = "150000").validate()
         assertTrue(errors.isValid)
+    }
+
+    @Test
+    fun `transaction id rejects punctuation the backend forbids`() {
+        assertNotNull(validForm().copy(transactionId = "TXN 8742").validate().transactionId)
+        assertNotNull(validForm().copy(transactionId = "TXN/8742").validate().transactionId)
+        assertNull(validForm().copy(transactionId = "TXN_874-291").validate().transactionId)
+    }
+
+    @Test
+    fun `a booking without a screenshot is blocked`() {
+        assertNotNull(validForm().copy(screenshotUri = null).validate().screenshot)
+        assertNotNull(validForm().copy(screenshotUri = "  ").validate().screenshot)
     }
 
     @Test
@@ -139,48 +192,75 @@ class BookingFormTest {
     }
 
     /**
-     * The wire shape, against the documented example. Two things this pins down:
-     * dates go out as `yyyy-MM-dd` (not the `dd-MM-yyyy` the form displays), and the payload is
-     * wrapped in `bookingDetails`.
+     * The wire shape against the documented FormData keys. Dates go out as `yyyy-MM-dd` (not the
+     * `dd-MM-yyyy` the form displays), and the email is lowercased as the backend stores it.
      */
     @Test
-    fun `request matches the documented payload`() {
-        val json = Gson().toJsonTree(validForm().toRequest()).asJsonObject
-        val details = json.getAsJsonObject("bookingDetails")
-        assertNotNull("payload must be wrapped in bookingDetails", details)
+    fun `form fields match the documented keys`() {
+        val fields = validForm().toFormFields(leadId = "66b60e7f8a12bc0012345678")
 
-        assertEquals("John Doe", details.get("fullName").asString)
-        assertEquals("john.doe@example.com", details.get("emailId").asString)
-        assertEquals("9876543210", details.get("contactNumber").asString)
-        assertEquals("9123456780", details.get("emergencyContactNumber").asString)
-        assertEquals("Bali Honeymoon Package", details.get("packageName").asString)
-        assertEquals(2, details.get("noOfPax").asInt)
-        assertEquals("2026-08-15", details.get("startDate").asString)
-        assertEquals("2026-08-20", details.get("endDate").asString)
-        assertEquals(150000L, details.get("totalAmount").asLong)
-        assertEquals(50000L, details.get("paidAmount").asLong)
-        assertEquals(100000L, details.get("dueAmount").asLong)
+        assertEquals("John Doe", fields["travellerName"])
+        assertEquals("john.doe@example.com", fields["travellerEmail"])
+        assertEquals("9876543210", fields["travellerPhone"])
+        assertEquals("2", fields["adults"])
+        assertEquals("0", fields["children"])
+        assertEquals("Bali Honeymoon Package", fields["packageName"])
+        assertEquals("Ubud, Bali, Indonesia", fields["location"])
+        assertEquals("2026-08-15", fields["startDate"])
+        assertEquals("2026-08-20", fields["endDate"])
+        assertEquals("150000", fields["totalAmount"])
+        assertEquals("50000", fields["paidAmount"])
+        assertEquals("TXN874291857", fields["transactionId"])
+        assertEquals("FT HDFC", fields["paymentMode"])
+        assertEquals("66b60e7f8a12bc0012345678", fields["leadId"])
+    }
+
+    @Test
+    fun `email is lowercased for the backend`() {
+        val fields = validForm().copy(emailId = "John.Doe@Example.COM").toFormFields()
+        assertEquals("john.doe@example.com", fields["travellerEmail"])
     }
 
     /**
-     * Omitting both trip keys is what makes the backend append a new trip and generate its own
-     * `TRIP-XXXXXX`. Sending `tripIndex` would overwrite an existing trip instead — a silent data loss
-     * that no UI would reveal, so it's pinned here.
+     * The backend derives due from total minus paid and owns every id, status and ownership field.
+     * Sending a client-side `dueAmount` or `status` would be a number the server discards at best, and
+     * a fight with its "create always starts as Pending" rule at worst.
      */
     @Test
-    fun `request sends no tripId or tripIndex`() {
-        val details = Gson().toJsonTree(validForm().toRequest())
-            .asJsonObject.getAsJsonObject("bookingDetails")
-        assertFalse(details.has("tripId"))
-        assertFalse(details.has("tripIndex"))
+    fun `server-owned fields are never sent`() {
+        val fields = validForm().toFormFields(leadId = "abc123")
+        listOf("dueAmount", "status", "tripStatus", "bookingId", "paymentId", "createdBy")
+            .forEach { key -> assertFalse("$key is server-owned", fields.containsKey(key)) }
+    }
+
+    /** An absent lead id must be omitted, not sent blank — a blank would read as "update lead ''". */
+    @Test
+    fun `a missing lead id is omitted`() {
+        assertFalse(validForm().toFormFields(leadId = null).containsKey("leadId"))
+        assertFalse(validForm().toFormFields(leadId = "  ").containsKey("leadId"))
+    }
+
+    @Test
+    fun `every payment mode option matches the documented spelling`() {
+        assertEquals(
+            listOf(
+                "Kalpana BOI", "Kalpana PNB", "Babita AU",
+                "Hari Mohan BOB", "FT HDFC", "Pratyush SBI",
+            ),
+            PaymentMode.entries.map { it.apiValue },
+        )
+        // Fixed to HDFC because the form no longer lets an agent pick — the Payment Mode field is
+        // read-only, so this default is the only value this app ever sends.
+        assertEquals("FT HDFC", PaymentMode.DEFAULT.apiValue)
     }
 
     @Test
     fun `whitespace is trimmed before sending`() {
-        val details = Gson()
-            .toJsonTree(validForm().copy(fullName = "  John Doe  ", emailId = " a@b.com ").toRequest())
-            .asJsonObject.getAsJsonObject("bookingDetails")
-        assertEquals("John Doe", details.get("fullName").asString)
-        assertEquals("a@b.com", details.get("emailId").asString)
+        val fields = validForm()
+            .copy(fullName = "  John Doe  ", location = "  Bali  ", transactionId = " TXN1 ")
+            .toFormFields()
+        assertEquals("John Doe", fields["travellerName"])
+        assertEquals("Bali", fields["location"])
+        assertEquals("TXN1", fields["transactionId"])
     }
 }

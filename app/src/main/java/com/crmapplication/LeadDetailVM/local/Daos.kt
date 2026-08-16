@@ -70,6 +70,72 @@ interface NoteDao {
     }
 }
 
+/**
+ * Persisted call history. Queries key off `phoneKey` rather than `leadId` because a call can be
+ * ingested before its lead exists locally, and because a lead's id can churn while its number
+ * doesn't (see [CallEntity]).
+ *
+ * Every read takes a `since` cutoff — the lead's `assignedAt` — so pre-assignment calls stay out of
+ * history and counts. Pass 0 to mean "no cutoff".
+ */
+@Dao
+interface CallDao {
+
+    @Query(
+        "SELECT * FROM calls WHERE phoneKey = :phoneKey AND dateMillis >= :since " +
+            "ORDER BY dateMillis DESC"
+    )
+    fun observeCallsForNumber(phoneKey: String, since: Long): Flow<List<CallEntity>>
+
+    @Query(
+        "SELECT * FROM calls WHERE phoneKey = :phoneKey AND dateMillis >= :since " +
+            "ORDER BY dateMillis DESC"
+    )
+    suspend fun getCallsForNumber(phoneKey: String, since: Long): List<CallEntity>
+
+    // Upsert, not insert: re-reading a device row must correct a duration that was still 0 when the
+    // row was first seen, rather than inserting a second copy of the same call.
+    @Upsert
+    suspend fun upsertCalls(calls: List<CallEntity>)
+
+    @Query("SELECT COUNT(*) FROM calls WHERE phoneKey = :phoneKey AND dateMillis >= :since")
+    suspend fun countForNumber(phoneKey: String, since: Long): Int
+
+    @Query("DELETE FROM calls WHERE phoneKey = :phoneKey AND isFromServer = 1")
+    suspend fun deleteServerCallsForNumber(phoneKey: String)
+
+    /** Backfills [leadId] onto rows ingested before the lead was known locally. */
+    @Query("UPDATE calls SET leadId = :leadId WHERE phoneKey = :phoneKey AND leadId IS NULL")
+    suspend fun attachLeadId(phoneKey: String, leadId: String)
+
+    /** Sets or clears the agent's "this call reached a machine" mark on one call. */
+    @Query("UPDATE calls SET isVoicemail = :isVoicemail WHERE id = :callId")
+    suspend fun setVoicemail(callId: String, isVoicemail: Boolean)
+
+    /**
+     * Ids of every call the agent has marked as voicemail.
+     *
+     * Two callers, both load-bearing. `ingestDeviceCalls` re-reads them so its upsert carries the mark
+     * forward instead of resetting it, and the Dashboard — which computes from the device call log, not
+     * from this table — reads them to subtract those calls from talk time.
+     */
+    @Query("SELECT id FROM calls WHERE isVoicemail = 1")
+    suspend fun getVoicemailMarkedIds(): List<String>
+
+    /**
+     * Replaces the server-sourced rows for one number, leaving device-sourced rows untouched —
+     * the same server-vs-local split [NoteDao.replaceServerNotes] uses.
+     */
+    @Transaction
+    suspend fun replaceServerCalls(phoneKey: String, serverCalls: List<CallEntity>) {
+        deleteServerCallsForNumber(phoneKey)
+        if (serverCalls.isNotEmpty()) upsertCalls(serverCalls)
+    }
+
+    @Query("DELETE FROM calls")
+    suspend fun deleteAll()
+}
+
 @Dao
 interface StatusHistoryDao {
 

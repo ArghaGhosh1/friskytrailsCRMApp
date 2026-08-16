@@ -43,6 +43,7 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
@@ -55,6 +56,14 @@ android {
         compose = true
         buildConfig = true
     }
+}
+
+// Room writes the expected schema of every version here. Needed to verify a hand-written Migration
+// against what Room actually expects — Room hashes the schema and refuses to open a database whose
+// shape doesn't match, so an inexact CREATE TABLE crashes on launch instead of degrading. Commit these
+// JSON files: they're the reference for writing the next migration.
+ksp {
+    arg("room.schemaLocation", "$projectDir/schemas")
 }
 
 configurations.all {

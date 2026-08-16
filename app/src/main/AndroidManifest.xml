@@ -31,10 +31,16 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.CRMApplication">
+        <!--
+          adjustResize so the keyboard shrinks the window instead of panning it. The Booking form
+          reads IME insets to shrink its own card; panning would slide the whole window up and fight
+          that, hiding the field the agent just focused.
+        -->
         <activity
             android:name="com.crmapplication.MainActivity"
             android:exported="true"
             android:label="@string/app_name"
+            android:windowSoftInputMode="adjustResize"
             android:theme="@style/Theme.CRMApplication">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

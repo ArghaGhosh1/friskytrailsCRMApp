@@ -8,6 +8,7 @@ import androidx.lifecycle.viewModelScope
 import com.crmapplication.LeadDetailVM.repository.AuthRepository
 import com.crmapplication.LeadDetailVM.repository.BOOKED_STATUS
 import com.crmapplication.LeadDetailVM.repository.BookingForm
+import com.crmapplication.LeadDetailVM.repository.BookingReceipt
 import com.crmapplication.LeadDetailVM.repository.BugReport
 import com.crmapplication.LeadDetailVM.repository.BugReportRepository
 import com.crmapplication.LeadDetailVM.repository.CallLogSyncRepository
@@ -28,10 +29,12 @@ import com.crmapplication.LeadDetailVM.repository.mergeLabels
 import com.crmapplication.LeadDetailVM.remote.CreateLeadRequest
 import com.crmapplication.calllog.CallLogEntry
 import com.crmapplication.calllog.CallLogReader
+import com.crmapplication.calllog.normalizedPhoneKey
 import com.crmapplication.notification.ReminderScheduler
 import com.crmapplication.utils.ThemeManager
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import javax.inject.Inject
@@ -399,8 +402,18 @@ class DashboardViewModel @Inject constructor(
         }
     }
 
+    /**
+     * Stores the new calls locally, then pushes them to the backend.
+     *
+     * Ingest runs first and independently: it is the agent's own history, so it must land in Room even
+     * when the push fails (offline, expired token, a rejecting backend). The two are separate
+     * `runCatching`s for that reason — a failed push cannot roll back stored history.
+     */
     private fun logNewCalls() {
-        viewModelScope.launch { runCatching { callLogSyncRepo.syncNewCalls() } }
+        viewModelScope.launch {
+            runCatching { callLogSyncRepo.ingestDeviceCalls() }
+            runCatching { callLogSyncRepo.syncNewCalls() }
+        }
     }
 
     /**
@@ -543,6 +556,14 @@ data class LeadsUiState(
     /** One-shot: the booking reached the server. UI shows the confirmation, then calls `clearBookingSuccess()`. */
     val bookingSuccess: Boolean = false,
 
+    /**
+     * What the server confirmed for the booking behind [bookingSuccess] — carried so the confirmation
+     * can quote the `FT…` booking id instead of a bare "Booked". Cleared alongside it.
+     *
+     * Null on an older backend that replies without one; the UI falls back to a plain message.
+     */
+    val lastBooking: BookingReceipt? = null,
+
     // True once the first network sync has completed. Distinguishes "still loading, never synced"
     // (show progress, not the empty state) from "synced and genuinely empty" (show "No leads yet").
     val hasSynced: Boolean = false,
@@ -615,10 +636,32 @@ data class LeadsUiState(
             return listOf(LeadFilter.All) + fromConfig + listOfNotNull(active.takeIf { stale })
         }
 
+    /**
+     * Options for the list's product filter: the server catalog union whatever the leads on hand
+     * actually carry.
+     *
+     * Config comes first, in the server's order, so a product added on the backend is filterable
+     * immediately — before any lead carries it. That's the whole point of the union: derived-only
+     * (the old behaviour) meant a brand-new product was invisible here until a lead used it, even
+     * though the Add Lead dropdown already offered it.
+     *
+     * Lead-only products are kept rather than dropped, appended and sorted: a product retired from
+     * config can still be sitting on existing leads, and dropping it would leave those leads
+     * unreachable by filter. A stale [activeProduct] goes last for the same reason the status chips
+     * keep theirs — an active filter with no visible control is one the agent can't clear.
+     */
     val availableProducts: List<String>
-        get() = leads.mapNotNull { it.product?.takeIf { p -> p.isNotBlank() } }
-            .distinct()
-            .sorted()
+        get() {
+            val seen = HashSet<String>()
+            val fromConfig = products.mapNotNull { it.trim().takeIf(String::isNotEmpty) }
+                .filter { seen.add(it.lowercase()) }
+            val fromLeads = leads.mapNotNull { it.product?.trim()?.takeIf(String::isNotEmpty) }
+                .filter { seen.add(it.lowercase()) }
+                .sorted()
+            val stale = activeProduct?.trim()?.takeIf(String::isNotEmpty)
+                ?.takeIf { seen.add(it.lowercase()) }
+            return fromConfig + fromLeads + listOfNotNull(stale)
+        }
 }
 
 @HiltViewModel
@@ -791,9 +834,12 @@ class LeadsViewModel @Inject constructor(
     }
 
     /**
-     * Sends the completed form. On success the lead is `Booked` and its status locks; on failure the
-     * form stays open with the server's message so the agent can fix and retry — closing it would
-     * discard everything they typed.
+     * Sends the completed form. Either way the form closes and exactly one snackbar reports the
+     * outcome — `Booked` and a locked status on success, the server's message on failure.
+     *
+     * Closing on failure costs the agent what they typed, which is deliberate: the dialog's own window
+     * renders above the host Scaffold's snackbar, so a form left open hides the very message explaining
+     * why it failed, and the submit looks like it did nothing at all.
      */
     fun submitBooking(form: BookingForm) {
         val leadId = _state.value.bookingFor?.id ?: return
@@ -802,23 +848,37 @@ class LeadsViewModel @Inject constructor(
         viewModelScope.launch {
             _state.update { it.copy(isBooking = true, error = null) }
             repo.bookLead(leadId, form)
-                .onSuccess {
+                .onSuccess { receipt ->
                     _state.update {
-                        it.copy(isBooking = false, bookingFor = null, bookingSuccess = true)
+                        it.copy(
+                            isBooking = false,
+                            bookingFor = null,
+                            bookingSuccess = true,
+                            lastBooking = receipt,
+                        )
                     }
-                    // The backend rewrites the lead's name/product from the form and recalculates the
-                    // agent's booking count, so pull the authoritative row rather than guessing at it.
+                    // The booking API syncs the lead to `Booked` server-side, so pull the authoritative
+                    // row rather than trusting the local status write to match it.
                     sync(force = true)
                 }
                 .onFailure { e ->
+                    // Closed on failure too, so a submit always has one visible outcome: the form goes
+                    // away and either the success or the error snackbar says what happened. Leaving it
+                    // open (as this used to) reads as "nothing happened" when the error snackbar is
+                    // behind the dialog.
                     _state.update {
-                        it.copy(isBooking = false, error = e.message ?: "Could not book this lead")
+                        it.copy(
+                            isBooking = false,
+                            bookingFor = null,
+                            error = e.message ?: "Could not book this lead",
+                        )
                     }
                 }
         }
     }
 
-    fun clearBookingSuccess() = _state.update { it.copy(bookingSuccess = false) }
+    fun clearBookingSuccess() =
+        _state.update { it.copy(bookingSuccess = false, lastBooking = null) }
 
     fun clearError() = _state.update { it.copy(error = null) }
 
@@ -850,6 +910,18 @@ data class LeadDetailUiState(
     val myAgentId: String? = null,
 )
 
+/**
+ * Whether the dialog's open number refers to the same line as [phone].
+ *
+ * Compares normalised keys rather than raw strings: the dialog is opened with the lead's stored
+ * number while stored calls carry whatever the dialer recorded ("+91 90016 22113" vs "9001622113"),
+ * so exact equality would leave the dialog stuck on its loading spinner.
+ */
+private fun String?.matchesLeadPhone(phone: String): Boolean {
+    val mine = this?.normalizedPhoneKey().orEmpty()
+    return mine.isNotEmpty() && mine == phone.normalizedPhoneKey()
+}
+
 data class CallHistoryState(
     val number: String? = null,
     val isLoading: Boolean = false,
@@ -863,12 +935,17 @@ data class CallHistoryState(
 @OptIn(FlowPreview::class)
 class LeadDetailViewModel @Inject constructor(
     private val repo: LeadsRepository,
+    private val callLogSyncRepo: CallLogSyncRepository,
     private val callLogReader: CallLogReader,
     private val reminderScheduler: ReminderScheduler,
 ) : ViewModel() {
 
     private val _state = MutableStateFlow(LeadDetailUiState())
     val state: StateFlow<LeadDetailUiState> = _state.asStateFlow()
+
+    // Cancelled and replaced when the observed lead changes, so an old lead's rows can't land in the
+    // new lead's state.
+    private var callsJob: Job? = null
 
     init {
 
@@ -893,7 +970,55 @@ class LeadDetailViewModel @Inject constructor(
         }
 
         viewModelScope.launch { repo.refreshLeadNotes(lead.id) }
+        observeStoredCalls(lead)
         refreshCallLogMatch(lead.phone)
+        // Fresh install / new device: the device log has none of the agent's earlier calls but the
+        // backend may. No-ops when history already exists, and failures stay silent — a backfill is a
+        // bonus, not something the agent asked for, so it must not raise an error on this screen.
+        viewModelScope.launch {
+            callLogSyncRepo.backfillCallsForLead(lead.phone, lead.id, lead.assignedAt)
+        }
+    }
+
+    /**
+     * Streams this lead's stored call history out of Room, which is what makes it survive closing the
+     * dialog, leaving the screen, a restart and being offline — the screen used to re-read the device
+     * call log on every open and keep the result nowhere.
+     *
+     * Feeds both the summary counts and the open history dialog from the same rows, so the two can't
+     * disagree. Pushing the derived metrics to the backend deliberately does NOT happen here: this
+     * emits on any change to the `calls` table, including other leads' rows, which would turn a
+     * single sync into a burst of `PUT /booking` calls. [refreshCallLogMatch] owns the push.
+     */
+    private fun observeStoredCalls(lead: Lead) {
+        callsJob?.cancel()
+        callsJob = viewModelScope.launch {
+            callLogSyncRepo.observeCallsForLead(lead.phone, lead.assignedAt).collect { calls ->
+                val booking = bookingFromCalls(calls, todayOnly = false)
+                val callLabel = callLabelFor(calls)
+                _state.update { s ->
+                    s.copy(
+                        hasCallLogMatch = calls.isNotEmpty(),
+                        matchedCalls = calls,
+                        // Only when the dialog is showing this same number, so a stale open dialog
+                        // for another number isn't repopulated with this lead's calls.
+                        callHistory = if (s.callHistory.number.matchesLeadPhone(lead.phone)) {
+                            s.callHistory.copy(isLoading = false, calls = calls)
+                        } else s.callHistory,
+                        lead = if (booking != null && s.lead != null) {
+                            s.lead.copy(
+                                totalDial = booking.totalDial,
+                                connected = booking.connected,
+                                talkTime = booking.talkTime,
+                                firstCall = booking.firstCall,
+                                lastCall = booking.lastCall,
+                                labels = mergeLabels(s.lead.labels, callLabel),
+                            )
+                        } else s.lead,
+                    )
+                }
+            }
+        }
     }
 
     /**
@@ -917,57 +1042,42 @@ class LeadDetailViewModel @Inject constructor(
         }
     }
 
+    /**
+     * Pulls the device call log into Room, then pushes the resulting metrics to the backend.
+     *
+     * Does **not** touch the displayed history or counts — [observeStoredCalls] owns those and reacts
+     * to the rows this writes. Splitting it that way is what lets the screen show stored history
+     * before (or without) a fresh read, and keeps the `PUT /booking` push on an explicit trigger
+     * rather than on every emission of the Room Flow.
+     */
     private fun refreshCallLogMatch(number: String) {
-        if (!callLogReader.hasPermission()) {
-            _state.update { it.copy(hasCallLogMatch = false) }
-            return
-        }
         viewModelScope.launch {
-            // Cutoff: only this lead's post-assignment calls. Count cumulatively from assignment
-            // (todayOnly = false), not just today — this is the lead's running history.
-            val since = _state.value.lead?.assignedAt
-            val calls = callLogReader.callsForNumber(number, since)
-            val booking = bookingFromCalls(calls, todayOnly = false)
-            val callLabel = callLabelFor(calls)
-            _state.update { s ->
-                s.copy(
-                    hasCallLogMatch = calls.isNotEmpty(),
-                    matchedCalls = calls,
-
-                    lead = if (booking != null && s.lead != null) {
-                        s.lead.copy(
-                            totalDial = booking.totalDial,
-                            connected = booking.connected,
-                            talkTime = booking.talkTime,
-                            firstCall = booking.firstCall,
-                            lastCall = booking.lastCall,
-                            labels = mergeLabels(s.lead.labels, callLabel),
-                        )
-                    } else s.lead,
-                )
+            // Ingest is a no-op without READ_CALL_LOG; stored rows still drive the UI, so a denied
+            // permission degrades to "no new calls" rather than an empty screen.
+            if (callLogReader.hasPermission()) {
+                runCatching { callLogSyncRepo.ingestDeviceCalls() }
             }
-
-            if (calls.isNotEmpty()) {
-                _state.value.lead?.let { lead ->
-                    repo.updateBooking(lead.id, calls)
-                    repo.updateDates(lead.id, calls)
-                    repo.updateLabels(lead.id, lead.labels, calls)
-                }
-            }
+            val lead = _state.value.lead ?: return@launch
+            // Cutoff: only this lead's post-assignment calls, counted cumulatively from assignment
+            // (todayOnly = false) rather than just today — this is the lead's running history.
+            val calls = callLogSyncRepo.getStoredCallsForLead(lead.phone, lead.assignedAt)
+            if (calls.isEmpty()) return@launch
+            repo.updateBooking(lead.id, calls)
+            repo.updateDates(lead.id, calls)
+            repo.updateLabels(lead.id, lead.labels, calls)
         }
     }
 
+    /**
+     * Opens the history dialog. Always loads from Room first — stored history is shown even when
+     * READ_CALL_LOG is denied, which is the point of persisting it. The permission prompt is now a
+     * fallback for having nothing to show, not the immediate response to a missing permission.
+     */
     fun openCallHistory(number: String) {
         _state.update {
             it.copy(callHistory = CallHistoryState(number = number, isLoading = true))
         }
-        if (callLogReader.hasPermission()) {
-            loadCallsFor(number)
-        } else {
-            _state.update {
-                it.copy(callHistory = it.callHistory.copy(isLoading = false, needsPermission = true))
-            }
-        }
+        loadCallsFor(number)
     }
 
     fun onCallLogPermissionResult(granted: Boolean) {
@@ -985,16 +1095,58 @@ class LeadDetailViewModel @Inject constructor(
         _state.update { it.copy(callHistory = CallHistoryState()) }
     }
 
+    /**
+     * Flags one call in the history list as having reached voicemail instead of a person, or clears
+     * that flag. Only the agent knows this — the device call log records an answered machine exactly
+     * like an answered human.
+     *
+     * No local state is updated here on purpose: the write lands in Room and [observeStoredCalls]
+     * re-emits, which refreshes the dialog, the lead's counts and its talk time from one source. The
+     * backend push follows so the server's booking figures drop the same seconds.
+     */
+    fun setCallVoicemail(call: CallLogEntry, isVoicemail: Boolean) {
+        viewModelScope.launch {
+            callLogSyncRepo.setCallVoicemail(call, isVoicemail)
+                .onSuccess { applied ->
+                    if (!applied) {
+                        _state.update {
+                            it.copy(error = "This call came from the server, so it can't be edited here.")
+                        }
+                        return@onSuccess
+                    }
+                    val lead = _state.value.lead ?: return@onSuccess
+                    val calls = callLogSyncRepo.getStoredCallsForLead(lead.phone, lead.assignedAt)
+                    if (calls.isNotEmpty()) {
+                        repo.updateBooking(lead.id, calls)
+                        repo.updateLabels(lead.id, lead.labels, calls)
+                    }
+                }
+                .onFailure { e ->
+                    _state.update { it.copy(error = e.message ?: "Couldn't update that call.") }
+                }
+        }
+    }
+
     private fun loadCallsFor(number: String) {
         viewModelScope.launch {
             // Same assignment cutoff as the count: the history dialog shows only calls made after
             // this lead was assigned to the agent — nothing from a prior owner.
             val since = _state.value.lead?.assignedAt
-            val calls = callLogReader.callsForNumber(number, since)
+            val calls = callLogSyncRepo.getStoredCallsForLead(number, since)
             _state.update {
-
-                if (it.callHistory.number != number) it
-                else it.copy(callHistory = it.callHistory.copy(isLoading = false, calls = calls))
+                if (!it.callHistory.number.matchesLeadPhone(number)) it
+                else it.copy(
+                    callHistory = it.callHistory.copy(
+                        isLoading = false,
+                        calls = calls,
+                        // Only ask for permission when there is genuinely nothing stored to show.
+                        needsPermission = calls.isEmpty() && !callLogReader.hasPermission(),
+                    )
+                )
+            }
+            // Then pull anything new off the device; observeStoredCalls pushes it into the dialog.
+            if (callLogReader.hasPermission()) {
+                runCatching { callLogSyncRepo.ingestDeviceCalls() }
             }
         }
     }
