@@ -40,6 +40,8 @@ fun ProfileScreen(
     onLogout: () -> Unit,
     onBack: () -> Unit,
     onOpenBugReports: () -> Unit = {},
+    /** True while the sign-out is erasing local data; the button reports it and can't be re-tapped. */
+    isLoggingOut: Boolean = false,
     viewModel: ProfileViewModel = hiltViewModel(),
 ) {
     val state by viewModel.state.collectAsState()
@@ -215,6 +217,9 @@ fun ProfileScreen(
 
             OutlinedButton(
                 onClick = onLogout,
+                // Signing out erases local data and then navigates. Disabling here stops a second tap
+                // from queueing another wipe, and shows the agent that something is happening.
+                enabled = !isLoggingOut,
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(52.dp),
@@ -222,9 +227,21 @@ fun ProfileScreen(
                 colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFFDC2626)),
                 border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFDC2626)),
             ) {
-                Text("🚪", fontSize = 18.sp)
+                if (isLoggingOut) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(18.dp),
+                        strokeWidth = 2.dp,
+                        color = Color(0xFFDC2626),
+                    )
+                } else {
+                    Text("🚪", fontSize = 18.sp)
+                }
                 Spacer(Modifier.width(8.dp))
-                Text("Log Out", fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+                Text(
+                    if (isLoggingOut) "Signing out…" else "Log Out",
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 15.sp,
+                )
             }
             Spacer(Modifier.height(8.dp))
         }

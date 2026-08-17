@@ -33,6 +33,7 @@ import com.crmapplication.calllog.normalizedPhoneKey
 import com.crmapplication.notification.ReminderScheduler
 import com.crmapplication.utils.ThemeManager
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.*
@@ -67,6 +68,19 @@ data class AuthUiState(
     val approvalGranted: Boolean = false,
 
     val approvalCheckError: String? = null,
+
+    /** True while local data is being erased. The Profile screen disables its Logout button on it. */
+    val isLoggingOut: Boolean = false,
+
+    /**
+     * One-shot: the sign-out finished and every trace of the agent is gone from this device. The UI
+     * navigates to Login on this, then calls `clearLoggedOut()`.
+     *
+     * Navigation is gated on this rather than fired alongside `logout()` because the wipe is async —
+     * leaving for the login screen first would let a fast re-login start while the previous agent's
+     * rows were still on disk, which is the bug this whole path exists to prevent.
+     */
+    val loggedOut: Boolean = false,
 )
 
 @HiltViewModel
@@ -239,11 +253,32 @@ class AuthViewModel @Inject constructor(
         }
     }
 
+    /**
+     * Signs the agent out and erases their data from this device before reporting done.
+     *
+     * The identity fields are cleared **first**, synchronously, so the Profile screen stops showing the
+     * outgoing agent's name and email while the wipe runs. [AuthUiState.loggedOut] flips only once
+     * `repo.logout()` has finished, and navigation waits for it — see that field for why.
+     *
+     * A failed wipe still signs the agent out. Leaving them logged in with a cleared token would be a
+     * dead session, so the flag is set either way; the next sync prunes whatever survived.
+     */
     fun logout() {
-        repo.logout()
+        if (_state.value.isLoggingOut) return
+
         pendingPassword = null
-        _state.update { it.copy(isLoggedIn = false, agentName = "", agentEmail = "") }
+        _state.update {
+            it.copy(isLoggingOut = true, isLoggedIn = false, agentName = "", agentEmail = "")
+        }
+
+        viewModelScope.launch {
+            runCatching { repo.logout() }
+            _state.update { it.copy(isLoggingOut = false, loggedOut = true) }
+        }
     }
+
+    /** Consumes the one-shot [AuthUiState.loggedOut] signal after the UI has navigated. */
+    fun clearLoggedOut() = _state.update { it.copy(loggedOut = false) }
 
     fun refreshAgentInfo() {
         _state.update { it.copy(agentName = repo.getAgentName(), agentEmail = repo.getAgentEmail()) }
@@ -387,6 +422,9 @@ class DashboardViewModel @Inject constructor(
     private val _state = MutableStateFlow(DashboardUiState(isLoading = true))
     val state: StateFlow<DashboardUiState> = _state.asStateFlow()
 
+    /** The in-flight dashboard collection, cancelled when a newer [load] supersedes it. */
+    private var loadJob: Job? = null
+
     init {
         // Paint the last computed dashboard instantly if this VM was just recreated (nav re-entry).
         repo.lastData?.let { cached -> _state.update { it.copy(isLoading = false, data = cached) } }
@@ -433,12 +471,22 @@ class DashboardViewModel @Inject constructor(
             it.copy(data = it.data ?: repo.lastData, needsPermission = false, error = null, isLoading = true)
         }
 
-        viewModelScope.launch {
+        // One load at a time. `load()` is reachable from five places — init, the screen's ON_RESUME
+        // observer, the debounced call-log watcher, the permission result, and its own post-sync
+        // recursion — so several could otherwise collect this cold flow at once, each re-reading the
+        // entire device call log and every lead row for the same result. The newest call wins.
+        loadJob?.cancel()
+        loadJob = viewModelScope.launch {
             runCatching {
                 repo.getDashboard().collect { data ->
                     _state.update { it.copy(data = data) }
                 }
-            }.onFailure { e -> _state.update { it.copy(error = e.message) } }
+            }.onFailure { e ->
+                // A cancelled load is this method superseding itself, not a failure the agent should
+                // see — and rethrowing keeps structured concurrency honest.
+                if (e is CancellationException) throw e
+                _state.update { it.copy(error = e.message) }
+            }
             _state.update { it.copy(isLoading = false) }
         }
 

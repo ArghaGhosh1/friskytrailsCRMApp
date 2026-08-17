@@ -78,4 +78,23 @@ class CallSyncStore @Inject constructor(
         context.callSyncDataStore.edit { it[INSTALL_ID_KEY] = generated }
         return generated
     }
+
+    /**
+     * Resets the push bookkeeping on logout: the watermark and the pending set both describe what the
+     * *previous* agent still owed the server, and replaying that under a new token would post one
+     * agent's calls against another's account.
+     *
+     * [INSTALL_ID_KEY] is deliberately kept. It identifies the device, not the agent, and it's what
+     * makes a retried `POST /api/calls` idempotent — regenerating it would turn an in-flight retry into
+     * a duplicate.
+     *
+     * Clearing the watermark means the next `syncNewCalls` re-establishes a baseline rather than
+     * pushing the whole device log as the new agent's work.
+     */
+    suspend fun clearForSessionEnd() {
+        context.callSyncDataStore.edit { prefs ->
+            prefs.remove(WATERMARK_KEY)
+            prefs.remove(PENDING_KEY)
+        }
+    }
 }

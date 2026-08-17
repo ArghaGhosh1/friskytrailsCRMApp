@@ -68,7 +68,9 @@ import com.crmapplication.utils.cloudinaryPublicId
 import com.crmapplication.utils.DocumentPartFactory
 import com.crmapplication.utils.DueDateStore
 import com.crmapplication.utils.ProductCatalogStore
+import com.crmapplication.utils.SessionCleaner
 import com.crmapplication.utils.SessionManager
+import com.crmapplication.utils.SessionScopedState
 import com.crmapplication.utils.StatusCatalogStore
 import com.crmapplication.utils.formatApiDate
 import com.crmapplication.utils.formatClockTime
@@ -109,6 +111,7 @@ import javax.inject.Singleton
 class AuthRepository @Inject constructor(
     private val authApi: AuthApi,
     private val session: SessionManager,
+    private val sessionCleaner: SessionCleaner,
 ) {
 
     suspend fun register(name: String, email: String, password: String): Result<Boolean> = runCatching {
@@ -191,7 +194,26 @@ class AuthRepository @Inject constructor(
         user?.toProfile()
     }.mapApiError()
 
-    fun logout() = session.clear()
+    /**
+     * Ends the session: forgets the credentials, then erases everything the agent left on the device.
+     *
+     * Token first, data second, and the order is load-bearing. Clearing the token immediately makes any
+     * sync that starts from here fail with "Not logged in", so nothing can re-populate the tables
+     * behind the wipe. Wiping first would leave a window where an in-flight request still holds a valid
+     * token and writes the old agent's leads back into an emptied database.
+     *
+     * Suspending rather than fire-and-forget so the caller can wait: the login screen must not be able
+     * to accept a new agent while the previous one's rows are still on disk. See
+     * `AuthViewModel.logout`.
+     *
+     * One narrow window remains — a `syncLeads` already past its token read when logout begins can
+     * still land afterwards. The next sync's `deleteLeadsNotIn` prunes those rows, and the mutex in
+     * `LeadsRepository` keeps it to a single request rather than a pile.
+     */
+    suspend fun logout() {
+        session.clear()
+        sessionCleaner.clearForLogout()
+    }
     fun isLoggedIn() = session.getToken() != null
     fun getAgentName() = session.getAgentName()
     fun getAgentEmail() = session.getAgentEmail()
@@ -326,10 +348,38 @@ class DashboardRepository @Inject constructor(
     // Only for the agent's voicemail marks: the Dashboard computes from the device call log, but that
     // log can't express "reached a machine", so the marks have to come from here.
     private val callDao: CallDao,
-) {
+    sessionCleaner: SessionCleaner,
+) : SessionScopedState {
+
+    init {
+        // This Singleton outlives a logout, so its caches have to be told to forget the agent.
+        sessionCleaner.register(this)
+    }
 
     /** yyyy-MM-dd of the day we last successfully pushed "Present"; guards against re-pushing every refresh. */
     private var lastAttendancePush: String? = null
+
+    /**
+     * Last values fetched in the network stage, so the local stage can build with them instead of
+     * nulls.
+     *
+     * Without this the local stage always emitted `metrics = null` and zero attendance, so every
+     * refresh flashed "₹0 / ₹0" and "0P / 0A" on the Monthly card before the network stage replaced
+     * them a moment later. Seeding from the last known values means the card only ever changes when a
+     * fetch actually returns something different.
+     *
+     * It is also what makes [NETWORK_THROTTLE_MS] safe: a skipped network stage keeps the real figures
+     * on screen rather than reverting them to placeholders.
+     */
+    @Volatile private var cachedMetrics: AgentMetricsDto? = null
+    @Volatile private var cachedPresent: Int = 0
+    @Volatile private var cachedAbsent: Int = 0
+
+    /** Admin-set "P"/"A" for today, from the attendance log or metrics. Null = not known yet. */
+    @Volatile private var cachedTodayStatus: String? = null
+
+    /** When the network stage last completed. Guards the duplicate load on first composition. */
+    @Volatile private var lastNetworkAt: Long = 0L
 
     /**
      * Last computed dashboard, kept in-memory on this Singleton so it survives ViewModel
@@ -339,6 +389,25 @@ class DashboardRepository @Inject constructor(
     @Volatile
     var lastData: DashboardData? = null
         private set
+
+    /**
+     * Drops the cached dashboard and the attendance guard on logout.
+     *
+     * [lastData] is the most visible part of the leak this fixes: `DashboardViewModel.init` paints it
+     * immediately and deliberately, so without this the next agent's first frame showed the previous
+     * agent's dials, talk time and booking figures.
+     */
+    override fun resetSessionState() {
+        lastData = null
+        lastAttendancePush = null
+        // Per-agent figures: the monthly target and the P/A counts belong to whoever was signed in.
+        // Leaving them would show the previous agent's target on the next agent's first frame.
+        cachedMetrics = null
+        cachedPresent = 0
+        cachedAbsent = 0
+        cachedTodayStatus = null
+        lastNetworkAt = 0L
+    }
 
     fun hasCallLogPermission(): Boolean = callLogReader.hasPermission()
 
@@ -476,11 +545,23 @@ class DashboardRepository @Inject constructor(
             .groupBy({ it.first }, { it.second })
             .mapValues { (_, times) -> if (times.any { it == null }) null else times.filterNotNull().min() }
 
-        val localDaily = buildDailyStats(allCalls, startOfDay, endOfDay, now.timeInMillis, todayStatus = null, assignedByKey)
-        val localMonthly = buildMonthlyStats(startOfMonth, presentCount = 0, absentCount = 0, metrics = null, leads)
+        // Built from the last known network values, not from nulls: those are per-agent figures that
+        // don't change between refreshes, so seeding them keeps the Monthly card steady instead of
+        // flashing "₹0 / ₹0" and "0P / 0A" on every recompute.
+        val localDaily = buildDailyStats(
+            allCalls, startOfDay, endOfDay, now.timeInMillis, cachedTodayStatus, assignedByKey,
+        )
+        val localMonthly = buildMonthlyStats(startOfMonth, cachedPresent, cachedAbsent, cachedMetrics, leads)
         DashboardData(daily = localDaily, monthly = localMonthly)
             .also { lastData = it }
             .let { emit(it) }
+
+        // Skip the network stage if it ran moments ago. First composition triggers two full loads —
+        // `DashboardViewModel.init` calls load(), then the screen's ON_RESUME observer calls refresh()
+        // — which was six requests (metrics + attendance + monthly attendance, twice) for one screen
+        // open. The local stage above still emits, so the UI is unaffected; it now paints cached
+        // figures rather than placeholders.
+        if (System.currentTimeMillis() - lastNetworkAt < NETWORK_THROTTLE_MS) return@flow
 
         // --- Stage 2: network (best-effort, all concurrent) ---
         coroutineScope {
@@ -513,6 +594,15 @@ class DashboardRepository @Inject constructor(
 
             val daily = buildDailyStats(allCalls, startOfDay, endOfDay, now.timeInMillis, todayStatus, assignedByKey)
             val monthly = buildMonthlyStats(startOfMonth, presentCount, absentCount, metrics, leads)
+
+            // Kept so the next local stage can build with real figures instead of placeholders, and so
+            // a throttled compute doesn't lose them. Written even when a fetch returned null — that is
+            // still the current answer, and treating it as "no answer" would keep re-showing a stale one.
+            cachedMetrics = metrics
+            cachedPresent = presentCount
+            cachedAbsent = absentCount
+            cachedTodayStatus = todayStatus
+            lastNetworkAt = System.currentTimeMillis()
 
             DashboardData(daily = daily, monthly = monthly)
                 .also { lastData = it }
@@ -592,19 +682,26 @@ class DashboardRepository @Inject constructor(
         leads: List<LeadEntity>,
     ): MonthlyStats {
 
-        val bookedLeads = leads.count { it.status.equals("Booked", ignoreCase = true) }
-
-        val monthlyTarget = if (metrics?.monthlyTarget != null || metrics?.targetCompleted != null) {
-            "${metrics.targetCompleted ?: 0} - ${metrics.monthlyTarget ?: 0}"
-        } else {
-            "0 - 0"
-        }
+        // Progress against target is now money booked, not bookings closed: "₹1,50,000 / ₹5,00,000".
+        // The sale side is summed on-device from `leads.bookedAmount` (see monthlySaleAmount) because
+        // the booking service exposes no way to ask for it; the target side is the admin's figure from
+        // the metrics API. A failed metrics call leaves the target at ₹0 rather than hiding the sale
+        // total, which the device knows regardless.
+        //
+        // `metrics.targetCompleted` is deliberately dropped: it counts bookings, so pairing it with an
+        // amount would read as a total in rupees. The Booking Count row below carries the count.
+        val monthlySale = monthlySaleAmount(leads, startOfMonth)
+        val monthlyTarget = "${formatIndianAmount(monthlySale)} / " +
+            formatIndianAmount((metrics?.monthlyTarget ?: 0).toLong())
 
         return MonthlyStats(
             month = formatMonthLabel(startOfMonth),
             monthlyTarget = monthlyTarget,
-            bookingCount = "$bookedLeads / ${leads.size}",
-            totalSaleAmount = "0 / 0",
+            // Numerator is this month's bookings, so it resets with the month like the amount above.
+            // The denominator is leads on hand right now, which is NOT month-scoped — it's "of the
+            // leads you're holding, this many became bookings this month".
+            bookingCount = "${monthlyBookingCount(leads, startOfMonth)} / ${leads.size}",
+            totalSaleAmount = formatIndianAmount(monthlySale),
             attendance = "${presentCount}P / ${absentCount}A",
         )
     }
@@ -612,7 +709,86 @@ class DashboardRepository @Inject constructor(
     private companion object {
         const val DAY_MILLIS = 24L * 60 * 60 * 1000
         const val TAG = "DashboardRepo"
+
+        /**
+         * How long the network stage is suppressed after it completes.
+         *
+         * Sized to collapse the duplicate load on screen open (`DashboardViewModel.init` and the
+         * screen's `ON_RESUME` observer fire milliseconds apart), not to cache aggressively — the
+         * dashboard has no manual refresh, so a long window here would show stale attendance. The
+         * local stage is never throttled, so returning to the screen always recomputes today's call
+         * figures from the device log.
+         */
+        const val NETWORK_THROTTLE_MS = 10_000L
     }
+}
+
+/**
+ * When this lead's booking happened, or null if it never was booked.
+ *
+ * [LeadEntity.bookedAt] is the real stamp, written by `bookLead`. The fallback exists for leads booked
+ * **before** that column shipped (schema 16): those have no `bookedAt`, and the booking service has no
+ * GET route to recover one, so their status-change time is the only trace of when the sale happened.
+ * For a booked lead that proxy is sound — reaching `Booked` locks the status, so nothing moves
+ * `statusChangedAt` afterwards.
+ *
+ * The fallback is gated on the status for exactly that reason: on any other lead `statusChangedAt` is
+ * just "when the agent last changed the status", which is not a booking at all.
+ */
+private fun LeadEntity.bookedInstant(): Long? =
+    bookedAt ?: statusChangedAt?.takeIf { status.equals(BOOKED_STATUS, ignoreCase = true) }
+
+/**
+ * The bookings that belong to the month starting at [startOfMonth] — the shared basis for both monthly
+ * booking figures, so the count and the amount can never disagree about which sales they cover.
+ *
+ * Scoped by booking instant, not by current status: once money is booked in a month it belongs to that
+ * month, even if an admin later moves the lead out of `Booked`. There is no upper bound because
+ * [startOfMonth] is always the current month — a booking can't be in the future.
+ */
+private fun bookedThisMonth(leads: List<LeadEntity>, startOfMonth: Long): List<LeadEntity> =
+    leads.filter { (it.bookedInstant() ?: return@filter false) >= startOfMonth }
+
+/**
+ * Total value of the bookings made this month, summed from the local `bookedAmount` stamps.
+ *
+ * On-device because the booking service offers no way to ask: `BookingsApi` has only `createBooking`,
+ * and the leads payload carries no amount. So the figure covers bookings this device recorded — it
+ * starts from ₹0 on a fresh install, and a booking made on another phone isn't in it.
+ *
+ * A booking with no stored amount (either confirmed without a total, or made before schema 16) counts
+ * as zero rupees while still being a real booking — [monthlyBookingCount] is what reflects it.
+ */
+internal fun monthlySaleAmount(leads: List<LeadEntity>, startOfMonth: Long): Long =
+    bookedThisMonth(leads, startOfMonth).sumOf { it.bookedAmount ?: 0L }
+
+/**
+ * How many leads were booked this month.
+ *
+ * Month-scoped on purpose: this sits on the **Monthly** card, so like the sale amount it resets to 0
+ * when the month rolls over. It previously counted every `Booked` lead ever held, over the total lead
+ * count — a lifetime figure on a monthly card, which never reset and grew with every reassignment.
+ */
+internal fun monthlyBookingCount(leads: List<LeadEntity>, startOfMonth: Long): Int =
+    bookedThisMonth(leads, startOfMonth).size
+
+/**
+ * Formats whole rupees the Indian way — last three digits, then pairs: `150000` → `₹1,50,000`.
+ *
+ * Grouped by hand rather than with `NumberFormat`: the JDK's `en-IN` grouping has shifted between
+ * versions, and this has to match what an agent sees in the backend regardless of which JVM the unit
+ * tests run on. No decimals, because every amount in the booking form is a whole-rupee `Long`.
+ */
+internal fun formatIndianAmount(amount: Long): String {
+    val digits = kotlin.math.abs(amount).toString()
+    val grouped = if (digits.length <= 3) digits else {
+        val last3 = digits.takeLast(3)
+        val rest = digits.dropLast(3)
+        // Pairs, right to left: "10000" → "1,00,00" (so 10000000 reads ₹1,00,00,000 — one crore).
+        val pairs = rest.reversed().chunked(2).joinToString(",").reversed()
+        "$pairs,$last3"
+    }
+    return if (amount < 0) "-₹$grouped" else "₹$grouped"
 }
 
 @Singleton
@@ -627,7 +803,21 @@ class LeadsRepository @Inject constructor(
     private val statusHistoryDao: StatusHistoryDao,
     private val session: SessionManager,
     private val dueDateStore: DueDateStore,
-) {
+    sessionCleaner: SessionCleaner,
+) : SessionScopedState {
+
+    init {
+        sessionCleaner.register(this)
+    }
+
+    /**
+     * Forgets that a sync ever happened, so the new agent's first `syncLeads` actually hits the
+     * network. Without this the 30s throttle below would skip it — and since logout has just emptied
+     * Room, the new agent would sit looking at an empty list until the throttle expired.
+     */
+    override fun resetSessionState() {
+        lastSyncAt = 0L
+    }
 
     fun currentAgentId(): String? = session.getAgentId()
 
@@ -697,6 +887,14 @@ class LeadsRepository @Inject constructor(
                 // server response and wiped every edit within seconds of saving it.
                 travelDate = entity.travelDate ?: prior?.travelDate,
                 numberOfPersons = entity.numberOfPersons ?: prior?.numberOfPersons,
+                // Booking value: purely local, so `prior` is the ONLY source — there is no server
+                // field to fall back to and `dto.toEntity()` always leaves these null. Carried
+                // unconditionally rather than with the `entity.x ?: prior?.x` precedence used above,
+                // because an incoming null here means "the payload doesn't carry this", never
+                // "cleared". Omitting these two lines would zero the dashboard's monthly sale figure
+                // on the next refresh.
+                bookedAmount = prior?.bookedAmount,
+                bookedAt = prior?.bookedAt,
                 // Call-log cutoff: calls before this instant aren't this agent's work.
                 //
                 // Sourced from the server's `createdAt`, NOT from the moment this lead was first seen
@@ -1113,6 +1311,10 @@ class LeadsRepository @Inject constructor(
         val now = System.currentTimeMillis()
         val previousStatus = leadDao.getLeadById(leadId)?.status
         leadDao.updateStatus(leadId, BOOKED_STATUS, now)
+        // The device's only record of what this sale was worth — it feeds the dashboard's monthly
+        // amount. Written from the server's confirmed figure rather than the form, and only after the
+        // booking is accepted, so the total can never count a booking the backend rejected.
+        leadDao.setBookedAmount(leadId, booking.totalAmount, now)
         if (previousStatus != BOOKED_STATUS) {
             statusHistoryDao.insert(
                 StatusHistoryEntity(

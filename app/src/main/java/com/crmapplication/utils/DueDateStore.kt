@@ -70,6 +70,18 @@ class DueDateStore @Inject constructor(
         }
     }
 
+    /**
+     * Drops every stored reminder. Only for logout — these are keyed by the previous agent's lead ids,
+     * and a reassigned lead keeping its old reminder would resurrect one agent's reminder on another's
+     * lead.
+     *
+     * Unlike [retainOnly], this genuinely clears: the ambiguity that makes an empty sync unsafe there
+     * doesn't apply, because the agent explicitly ended the session.
+     */
+    suspend fun clearAll() {
+        context.dueDateDataStore.edit { it.clear() }
+    }
+
     private fun keyFor(leadId: String) = longPreferencesKey("$KEY_PREFIX$leadId")
 
     private companion object {

@@ -1,6 +1,7 @@
 package com.crmapplication.ui
 
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -47,6 +48,24 @@ fun CrmNavGraph() {
     val authState by authViewModel.state.collectAsState()
 
     val startDestination = if (authState.isLoggedIn) Routes.DASHBOARD else Routes.REGISTER
+
+    // Sign-out navigation, driven by the completed wipe rather than by the button tap.
+    //
+    // `logout()` erases the agent's local data asynchronously; leaving for Login the moment it was
+    // called meant a fast re-login could begin while the previous agent's leads were still in Room —
+    // exactly the cross-account bleed this path exists to prevent. Waiting on `loggedOut` guarantees
+    // the database is empty before any new credentials can be entered.
+    //
+    // Hoisted to the graph level, not nested in the Profile composable's lambda: the effect belongs to
+    // the graph that owns the NavController, and it has to survive Profile leaving the composition —
+    // which is precisely what this navigation causes.
+    LaunchedEffect(authState.loggedOut) {
+        if (!authState.loggedOut) return@LaunchedEffect
+        navController.navigate(Routes.LOGIN) {
+            popUpTo(0) { inclusive = true }
+        }
+        authViewModel.clearLoggedOut()
+    }
 
     NavHost(navController = navController, startDestination = startDestination) {
 
@@ -164,12 +183,10 @@ fun CrmNavGraph() {
             ProfileScreen(
                 agentName = authState.agentName,
                 agentEmail = authState.agentEmail,
-                onLogout = {
-                    authViewModel.logout()
-                    navController.navigate(Routes.LOGIN) {
-                        popUpTo(0) { inclusive = true }
-                    }
-                },
+                // Navigation deliberately absent here — the LaunchedEffect above leaves for Login once
+                // the data wipe has actually finished.
+                onLogout = { authViewModel.logout() },
+                isLoggingOut = authState.isLoggingOut,
 
                 onOpenBugReports = { navController.navigate(Routes.BUG_REPORTS) },
                 onBack = { navController.popBackStack() },

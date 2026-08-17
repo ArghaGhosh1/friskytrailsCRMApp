@@ -23,6 +23,17 @@ interface LeadDao {
     @Query("UPDATE leads SET status = :status, statusChangedAt = :changedAt WHERE id = :leadId")
     suspend fun updateStatus(leadId: String, status: String, changedAt: Long)
 
+    /**
+     * Records what a confirmed booking was worth. Targeted for the same reason as [updateLeadInfo] —
+     * a concurrent `syncLeads` must not clobber it with a row read before the booking landed.
+     *
+     * Only ever called after the booking service accepts, so there is no "clear" case; a null
+     * [amount] means the server confirmed the booking without a total, and the sale still counts as
+     * having happened at [bookedAt].
+     */
+    @Query("UPDATE leads SET bookedAmount = :amount, bookedAt = :bookedAt WHERE id = :leadId")
+    suspend fun setBookedAmount(leadId: String, amount: Long?, bookedAt: Long)
+
     // Targeted rather than an upsert of the whole row: a concurrent syncLeads writing the same lead
     // shouldn't have its other columns clobbered by a stale copy read before the edit.
     @Query(
@@ -108,6 +119,17 @@ interface CallDao {
     @Query("UPDATE calls SET leadId = :leadId WHERE phoneKey = :phoneKey AND leadId IS NULL")
     suspend fun attachLeadId(phoneKey: String, leadId: String)
 
+    /**
+     * Detaches every call from its lead, without deleting the calls themselves.
+     *
+     * Used on logout: `leadId` points at the previous agent's leads, so it must not survive an account
+     * switch — but the rows are this **device's** call history, and the backend can only backfill
+     * answered calls, so deleting them would permanently lose anything older than the device log keeps.
+     * `ingestDeviceCalls` re-attaches each row by `phoneKey` to whichever leads the new agent owns.
+     */
+    @Query("UPDATE calls SET leadId = NULL")
+    suspend fun clearLeadLinks()
+
     /** Sets or clears the agent's "this call reached a machine" mark on one call. */
     @Query("UPDATE calls SET isVoicemail = :isVoicemail WHERE id = :callId")
     suspend fun setVoicemail(callId: String, isVoicemail: Boolean)
@@ -163,6 +185,14 @@ interface BugReportDao {
 
     @Query("DELETE FROM bug_reports WHERE id NOT LIKE '%-%'")
     suspend fun deleteServerReports()
+
+    /**
+     * Wipes the list, including reports that never reached the server. For logout only: the reports
+     * carry the previous agent's name as reporter, and this list is team-wide, so the next agent
+     * re-fetches it from `GET /api/bugs` anyway.
+     */
+    @Query("DELETE FROM bug_reports")
+    suspend fun deleteAll()
 
     /**
      * Swaps in a fresh server list while leaving unsent local reports (UUID ids) alone, so a sync

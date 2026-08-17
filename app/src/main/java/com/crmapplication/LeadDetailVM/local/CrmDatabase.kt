@@ -21,7 +21,9 @@ import androidx.room.TypeConverters
     // This was the first version to get a real migration — every earlier bump dropped the whole
     // database. Any future bump needs its own Migration in that file; see AppModule.provideDatabase.
     // 14 → 15: `calls.isVoicemail`, the agent's per-call voicemail mark (MIGRATION_14_15).
-    version = 15,
+    // 15 → 16: `leads.bookedAmount` + `leads.bookedAt`, the local-only record of a booking's value,
+    // which is what the dashboard's monthly sale figure sums (MIGRATION_15_16).
+    version = 16,
     // Exported to app/schemas (see the ksp block in build.gradle.kts). Was false, which is part of how
     // the destructive-migration habit went unnoticed: with no exported schema there was nothing to
     // diff a migration against, and no way to tell that a version bump needed one.

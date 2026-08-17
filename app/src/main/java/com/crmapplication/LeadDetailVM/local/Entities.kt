@@ -34,6 +34,20 @@ data class LeadEntity(
     val createdAt: Long = System.currentTimeMillis(),
     val dueDate: Long? = null,
 
+    // The booking's deal value (`totalAmount` as the server confirmed it) and when it was booked.
+    // Both LOCAL-ONLY: nothing in the leads payload carries them, and the booking service has no GET
+    // route, so this is the only record of what an agent sold. They feed the dashboard's monthly
+    // amount and so must be re-applied on every syncLeads, like dueDate and statusChangedAt.
+    //
+    // `totalAmount` rather than `paidAmount` deliberately — the backend recomputes paid from
+    // *verified* payments only, so a fresh booking's paid is 0 (see BookingsApi.BookingDto).
+    //
+    // bookedAt is separate from statusChangedAt even though both are stamped at booking time:
+    // statusChangedAt is general-purpose and moves on any status write, while this must stay pinned
+    // to the sale for the month filter to keep working.
+    val bookedAmount: Long? = null,
+    val bookedAt: Long? = null,
+
     // Cutoff for call-log analytics: calls before this instant belong to a prior owner and are
     // excluded from history, counts and pushes.
     //

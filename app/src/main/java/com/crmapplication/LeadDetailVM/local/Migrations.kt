@@ -62,8 +62,27 @@ val MIGRATION_14_15 = object : Migration(14, 15) {
     }
 }
 
+/**
+ * 15 → 16: adds `leads.bookedAmount` and `leads.bookedAt`, the local-only record of what a booking
+ * was worth and when it happened.
+ *
+ * Additive and nullable, so existing rows survive and read as "no stored amount" — which is the
+ * truth: bookings made before this version were never recorded anywhere on the device, and the
+ * booking service has no GET route to backfill them from. The dashboard's monthly figure therefore
+ * starts accruing from bookings made after this update rather than showing history.
+ *
+ * No DEFAULT clause, unlike [MIGRATION_14_15]: these columns are nullable, and null is the value we
+ * want for pre-existing rows.
+ */
+val MIGRATION_15_16 = object : Migration(15, 16) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE `leads` ADD COLUMN `bookedAmount` INTEGER")
+        db.execSQL("ALTER TABLE `leads` ADD COLUMN `bookedAt` INTEGER")
+    }
+}
+
 /** Every migration [CrmDatabase] knows about, in ascending order. */
-val CRM_MIGRATIONS: Array<Migration> = arrayOf(MIGRATION_13_14, MIGRATION_14_15)
+val CRM_MIGRATIONS: Array<Migration> = arrayOf(MIGRATION_13_14, MIGRATION_14_15, MIGRATION_15_16)
 
 /**
  * Versions that may still be wiped rather than migrated, because no migration was ever written for
