@@ -1428,6 +1428,8 @@ class ConfigRepository @Inject constructor(
 
     @Volatile private var lastSyncAt: Long = 0L
 
+
+
     /**
      * Fetches both lists in one request and caches them. [force] bypasses the throttle that
      * collapses the near simultaneous calls from ViewModel init, screen entry, and the lead poll
@@ -2099,8 +2101,12 @@ fun bookingFromCalls(
 
     //Today's calls
     val dayStart = startOfDayMillis(now)
-    val dayEnd = dayStart + 24L * 60 * 60 * 1000
-    val todaysCalls = calls.filter { it.dateMillis in dayStart until dayEnd }
+    val nextMidnight = java.util.Calendar.getInstance().apply {
+        timeInMillis = dayStart
+        add(java.util.Calendar.DAY_OF_MONTH, 1)
+    }.timeInMillis
+
+    val todaysCalls = calls.filter { it.dateMillis in dayStart until nextMidnight }
 
     val scoped = if (todayOnly) {
         todaysCalls
