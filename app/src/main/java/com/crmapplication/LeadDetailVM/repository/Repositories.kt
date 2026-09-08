@@ -2116,7 +2116,6 @@ fun bookingFromCalls(
     if (scoped.isEmpty()) return null
     // Excludes voicemail (see `talkTimeSeconds`), so the talk time pushed to the backend matches the
     // dial and connected counts below, which already ignore it.
-    val talkSeconds = scoped.sumOf { it.talkTimeSeconds }
     // Same `countsAsDial` rule the Dashboard uses, which is what stops the lead card and lead detail
     // from printing a different dial count than the Dashboard for the very same calls.
 
