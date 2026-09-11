@@ -1428,6 +1428,8 @@ class ConfigRepository @Inject constructor(
 
     @Volatile private var lastSyncAt: Long = 0L
 
+
+
     /**
      * Fetches both lists in one request and caches them. [force] bypasses the throttle that
      * collapses the near simultaneous calls from ViewModel init, screen entry, and the lead poll
@@ -2096,27 +2098,51 @@ fun bookingFromCalls(
     //    the lead's post-assignment history (CallLogReader.callsForNumber sinceMillis), so here we
     //    count the whole list: every dial/call since the lead was assigned, across all days.
     // Either way, an empty window returns null so an idle lead never overwrites stored values with zeros.
+
+    //Today's calls
+    val dayStart = startOfDayMillis(now)
+    val nextMidnight = java.util.Calendar.getInstance().apply {
+        timeInMillis = dayStart
+        add(java.util.Calendar.DAY_OF_MONTH, 1)
+    }.timeInMillis
+
+    val todaysCalls = calls.filter { it.dateMillis in dayStart until nextMidnight }
+
     val scoped = if (todayOnly) {
-        val dayStart = startOfDayMillis(now)
-        val dayEnd = dayStart + 24L * 60 * 60 * 1000
-        calls.filter { it.dateMillis in dayStart until dayEnd }
+        todaysCalls
     } else {
         calls
     }.sortedBy { it.dateMillis }
     if (scoped.isEmpty()) return null
     // Excludes voicemail (see `talkTimeSeconds`), so the talk time pushed to the backend matches the
     // dial and connected counts below, which already ignore it.
-    val talkSeconds = scoped.sumOf { it.talkTimeSeconds }
     // Same `countsAsDial` rule the Dashboard uses, which is what stops the lead card and lead detail
     // from printing a different dial count than the Dashboard for the very same calls.
-    val dials = scoped.count { it.countsAsDial }
+
+    // Strictly today's totals (will be 0 if no calls were made today)
+    val dailyDials = todaysCalls.count {
+        it.countsAsDial
+    }
+
+    val dailyTalkSeconds = todaysCalls.sumOf {
+        it.talkTimeSeconds
+    }
+
+    // Cumulative totals (across all days)
+    val totalDials = scoped.count {
+        it.countsAsDial
+    }
+
+    val totalTalkSeconds = scoped.sumOf {
+        it.talkTimeSeconds
+    }
     return UpdateBookingRequest(
-        totalDial = dials,
-        dailyDial = dials,
+        totalDial = totalDials,
+        dailyDial = dailyDials,
         // Excludes agent-marked voicemails, matching the Dashboard's Connected Calls tile.
         connected = scoped.count { it.countsAsConnected },
-        talkTime = formatTalkTimeClock(talkSeconds),
-        dailyTalkTime = formatTalkTimeClock(talkSeconds),
+        talkTime = formatTalkTimeClock(totalTalkSeconds),
+        dailyTalkTime = formatTalkTimeClock(dailyTalkSeconds),
         firstCall = scoped.first().dateMillis.let(::formatIso8601),
         lastCall = scoped.last().dateMillis.let(::formatIso8601),
     )
