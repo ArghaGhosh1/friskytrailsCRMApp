@@ -83,7 +83,10 @@ fun LeadDetailScreen(
     val detailState by detailVm.state.collectAsState()
     val context = LocalContext.current
 
-    val lead = leadsState.leads.find { it.id == leadId }
+    val listLead = leadsState.leads.find { it.id == leadId }
+    val detailLead = detailState.lead
+
+    val lead = detailLead ?: listLead
 
     LaunchedEffect(lead) {
         lead?.let { detailVm.loadLead(it) }

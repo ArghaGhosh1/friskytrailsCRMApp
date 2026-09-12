@@ -121,7 +121,12 @@ class AuthViewModel @Inject constructor(
 
                         resumePendingVerification(email.trim())
                     } else {
-                        _state.update { it.copy(isLoading = false, error = e.message ?: "Registration failed") }
+                        _state.update {
+                            it.copy(
+                                isLoading = false,
+                                error = e.message ?: "Registration failed"
+                            )
+                        }
                     }
                 }
         }
@@ -131,7 +136,12 @@ class AuthViewModel @Inject constructor(
         repo.resendOtp(email)
             .onSuccess {
                 _state.update {
-                    it.copy(isLoading = false, registerSuccess = true, pendingEmail = email, otpResent = true)
+                    it.copy(
+                        isLoading = false,
+                        registerSuccess = true,
+                        pendingEmail = email,
+                        otpResent = true
+                    )
                 }
             }
             .onFailure {
@@ -148,9 +158,22 @@ class AuthViewModel @Inject constructor(
             repo.verifyEmail(email, otp)
                 .onSuccess {
 
-                    _state.update { it.copy(isLoading = false, verifySuccess = true, awaitingApproval = true) }
+                    _state.update {
+                        it.copy(
+                            isLoading = false,
+                            verifySuccess = true,
+                            awaitingApproval = true
+                        )
+                    }
                 }
-                .onFailure { e -> _state.update { it.copy(isLoading = false, error = e.message ?: "Verification failed") } }
+                .onFailure { e ->
+                    _state.update {
+                        it.copy(
+                            isLoading = false,
+                            error = e.message ?: "Verification failed"
+                        )
+                    }
+                }
         }
     }
 
@@ -161,7 +184,14 @@ class AuthViewModel @Inject constructor(
             _state.update { it.copy(isLoading = true, error = null) }
             repo.resendOtp(email)
                 .onSuccess { _state.update { it.copy(isLoading = false, otpResent = true) } }
-                .onFailure { e -> _state.update { it.copy(isLoading = false, error = e.message ?: "Could not resend OTP") } }
+                .onFailure { e ->
+                    _state.update {
+                        it.copy(
+                            isLoading = false,
+                            error = e.message ?: "Could not resend OTP"
+                        )
+                    }
+                }
         }
     }
 
@@ -188,7 +218,12 @@ class AuthViewModel @Inject constructor(
                         resumeEmailVerification(email.trim())
                     } else {
 
-                        _state.update { it.copy(isLoading = false, error = e.message ?: "Login failed") }
+                        _state.update {
+                            it.copy(
+                                isLoading = false,
+                                error = e.message ?: "Login failed"
+                            )
+                        }
                     }
                 }
         }
@@ -198,7 +233,12 @@ class AuthViewModel @Inject constructor(
         repo.resendOtp(email)
             .onSuccess {
                 _state.update {
-                    it.copy(isLoading = false, needsEmailVerification = true, pendingEmail = email, otpResent = true)
+                    it.copy(
+                        isLoading = false,
+                        needsEmailVerification = true,
+                        pendingEmail = email,
+                        otpResent = true
+                    )
                 }
             }
             .onFailure {
@@ -237,16 +277,18 @@ class AuthViewModel @Inject constructor(
                 .onFailure { e ->
                     val msg = e.message.orEmpty()
                     val stillWaiting = e is EmailNotVerifiedException ||
-                        msg.contains("pending", ignoreCase = true) ||
-                        msg.contains("approval", ignoreCase = true) ||
-                        msg.contains("too many", ignoreCase = true)
+                            msg.contains("pending", ignoreCase = true) ||
+                            msg.contains("approval", ignoreCase = true) ||
+                            msg.contains("too many", ignoreCase = true)
                     _state.update {
                         if (stillWaiting) {
 
                             it.copy(isCheckingApproval = false, approvalCheckError = null)
                         } else {
 
-                            it.copy(isCheckingApproval = false, approvalCheckError = msg.ifBlank { "Could not verify approval" })
+                            it.copy(
+                                isCheckingApproval = false,
+                                approvalCheckError = msg.ifBlank { "Could not verify approval" })
                         }
                     }
                 }
@@ -281,7 +323,12 @@ class AuthViewModel @Inject constructor(
     fun clearLoggedOut() = _state.update { it.copy(loggedOut = false) }
 
     fun refreshAgentInfo() {
-        _state.update { it.copy(agentName = repo.getAgentName(), agentEmail = repo.getAgentEmail()) }
+        _state.update {
+            it.copy(
+                agentName = repo.getAgentName(),
+                agentEmail = repo.getAgentEmail()
+            )
+        }
     }
 
     fun requestPasswordReset(email: String) {
@@ -289,9 +336,22 @@ class AuthViewModel @Inject constructor(
             _state.update { it.copy(isLoading = true, error = null) }
             repo.requestPasswordReset(email)
                 .onSuccess {
-                    _state.update { it.copy(isLoading = false, forgotOtpSent = true, pendingEmail = email.trim()) }
+                    _state.update {
+                        it.copy(
+                            isLoading = false,
+                            forgotOtpSent = true,
+                            pendingEmail = email.trim()
+                        )
+                    }
                 }
-                .onFailure { e -> _state.update { it.copy(isLoading = false, error = e.message ?: "Could not send OTP") } }
+                .onFailure { e ->
+                    _state.update {
+                        it.copy(
+                            isLoading = false,
+                            error = e.message ?: "Could not send OTP"
+                        )
+                    }
+                }
         }
     }
 
@@ -300,8 +360,23 @@ class AuthViewModel @Inject constructor(
         viewModelScope.launch {
             _state.update { it.copy(isLoading = true, error = null) }
             repo.verifyResetOtp(email, otp)
-                .onSuccess { _state.update { it.copy(isLoading = false, forgotVerified = true, resetOtp = otp.trim()) } }
-                .onFailure { e -> _state.update { it.copy(isLoading = false, error = e.message ?: "Invalid OTP") } }
+                .onSuccess {
+                    _state.update {
+                        it.copy(
+                            isLoading = false,
+                            forgotVerified = true,
+                            resetOtp = otp.trim()
+                        )
+                    }
+                }
+                .onFailure { e ->
+                    _state.update {
+                        it.copy(
+                            isLoading = false,
+                            error = e.message ?: "Invalid OTP"
+                        )
+                    }
+                }
         }
     }
 
@@ -312,7 +387,14 @@ class AuthViewModel @Inject constructor(
             _state.update { it.copy(isLoading = true, error = null) }
             repo.requestPasswordReset(email)
                 .onSuccess { _state.update { it.copy(isLoading = false, otpResent = true) } }
-                .onFailure { e -> _state.update { it.copy(isLoading = false, error = e.message ?: "Could not resend OTP") } }
+                .onFailure { e ->
+                    _state.update {
+                        it.copy(
+                            isLoading = false,
+                            error = e.message ?: "Could not resend OTP"
+                        )
+                    }
+                }
         }
     }
 
@@ -322,7 +404,14 @@ class AuthViewModel @Inject constructor(
             _state.update { it.copy(isLoading = true, error = null) }
             repo.resetPassword(email, otp, newPassword)
                 .onSuccess { _state.update { it.copy(isLoading = false, resetSuccess = true) } }
-                .onFailure { e -> _state.update { it.copy(isLoading = false, error = e.message ?: "Could not reset password") } }
+                .onFailure { e ->
+                    _state.update {
+                        it.copy(
+                            isLoading = false,
+                            error = e.message ?: "Could not reset password"
+                        )
+                    }
+                }
         }
     }
 
@@ -468,7 +557,12 @@ class DashboardViewModel @Inject constructor(
         }
 
         _state.update {
-            it.copy(data = it.data ?: repo.lastData, needsPermission = false, error = null, isLoading = true)
+            it.copy(
+                data = it.data ?: repo.lastData,
+                needsPermission = false,
+                error = null,
+                isLoading = true
+            )
         }
 
         // One load at a time. `load()` is reachable from five places — init, the screen's ON_RESUME
@@ -669,7 +763,7 @@ data class LeadsUiState(
                 val nameMatch = lead.name.contains(q, ignoreCase = true)
                 val digits = q.filter(Char::isDigit)
                 val phoneMatch = digits.isNotEmpty() &&
-                    lead.phone.filter(Char::isDigit).contains(digits)
+                        lead.phone.filter(Char::isDigit).contains(digits)
                 nameMatch || phoneMatch
             }
 
@@ -708,7 +802,7 @@ data class LeadsUiState(
             val fromConfig = statuses.filterNot(::isBookedStatus).map(LeadFilter::forStatus)
             val active = activeFilter
             val stale = active != null && active.statusMatch != null &&
-                fromConfig.none { it.statusMatch.equals(active.statusMatch, ignoreCase = true) }
+                    fromConfig.none { it.statusMatch.equals(active.statusMatch, ignoreCase = true) }
             return listOf(LeadFilter.All) + fromConfig + listOfNotNull(active.takeIf { stale })
         }
 
@@ -752,7 +846,12 @@ class LeadsViewModel @Inject constructor(
     init {
         viewModelScope.launch {
             repo.observeLeads().collect { leads ->
-                _state.update { it.copy(isLoading = false, leads = sortedLeads(leads, it.sortOrder)) }
+                _state.update {
+                    it.copy(
+                        isLoading = false,
+                        leads = sortedLeads(leads, it.sortOrder)
+                    )
+                }
             }
         }
         // Separate collectors: config is server-owned and refreshes on its own schedule, so a fetch
@@ -821,7 +920,14 @@ class LeadsViewModel @Inject constructor(
             _state.update { it.copy(isCreating = true, error = null) }
             repo.createLead(request)
                 .onSuccess { _state.update { it.copy(isCreating = false, createSuccess = true) } }
-                .onFailure { e -> _state.update { it.copy(isCreating = false, error = e.message ?: "Could not create lead") } }
+                .onFailure { e ->
+                    _state.update {
+                        it.copy(
+                            isCreating = false,
+                            error = e.message ?: "Could not create lead"
+                        )
+                    }
+                }
         }
     }
 
@@ -888,7 +994,8 @@ class LeadsViewModel @Inject constructor(
                     _state.update {
                         it.copy(
                             isSavingLeadInfo = false,
-                            error = e.message ?: "Saved on this device, but couldn't reach the server",
+                            error = e.message
+                                ?: "Saved on this device, but couldn't reach the server",
                         )
                     }
                 }
@@ -960,8 +1067,8 @@ class LeadsViewModel @Inject constructor(
 
     private fun sortedLeads(leads: List<Lead>, order: SortOrder) = when (order) {
         SortOrder.BY_DUE_DATE -> leads.sortedWith(compareBy(nullsLast()) { it.dueDate })
-        SortOrder.BY_AGE      -> leads.sortedByDescending { it.createdAt }
-        SortOrder.BY_NAME     -> leads.sortedBy { it.name }
+        SortOrder.BY_AGE -> leads.sortedByDescending { it.createdAt }
+        SortOrder.BY_NAME -> leads.sortedBy { it.name }
     }
 }
 
@@ -1159,11 +1266,25 @@ class LeadDetailViewModel @Inject constructor(
     fun onCallLogPermissionResult(granted: Boolean) {
         val number = _state.value.callHistory.number ?: return
         if (granted) {
-            _state.update { it.copy(callHistory = it.callHistory.copy(needsPermission = false, isLoading = true)) }
+            _state.update {
+                it.copy(
+                    callHistory = it.callHistory.copy(
+                        needsPermission = false,
+                        isLoading = true
+                    )
+                )
+            }
             loadCallsFor(number)
             refreshCallLogMatch(number)
         } else {
-            _state.update { it.copy(callHistory = it.callHistory.copy(needsPermission = true, isLoading = false)) }
+            _state.update {
+                it.copy(
+                    callHistory = it.callHistory.copy(
+                        needsPermission = true,
+                        isLoading = false
+                    )
+                )
+            }
         }
     }
 
@@ -1233,8 +1354,22 @@ class LeadDetailViewModel @Inject constructor(
         viewModelScope.launch {
             _state.update { it.copy(isSavingNote = true, error = null) }
             repo.addNote(leadId, text)
-                .onSuccess { _state.update { it.copy(isSavingNote = false, noteSaveSuccess = true) } }
-                .onFailure { e -> _state.update { it.copy(isSavingNote = false, error = e.message) } }
+                .onSuccess {
+                    _state.update {
+                        it.copy(
+                            isSavingNote = false,
+                            noteSaveSuccess = true
+                        )
+                    }
+                }
+                .onFailure { e ->
+                    _state.update {
+                        it.copy(
+                            isSavingNote = false,
+                            error = e.message
+                        )
+                    }
+                }
         }
     }
 
@@ -1242,7 +1377,13 @@ class LeadDetailViewModel @Inject constructor(
         val leadId = _state.value.lead?.id ?: return
         viewModelScope.launch {
             repo.deleteNote(leadId, note.id)
-                .onFailure { e -> _state.update { it.copy(error = e.message ?: "Couldn't delete the note.") } }
+                .onFailure { e ->
+                    _state.update {
+                        it.copy(
+                            error = e.message ?: "Couldn't delete the note."
+                        )
+                    }
+                }
         }
     }
 
@@ -1251,8 +1392,22 @@ class LeadDetailViewModel @Inject constructor(
         viewModelScope.launch {
             _state.update { it.copy(isUploading = true, error = null) }
             repo.uploadDocument(leadId, uri)
-                .onSuccess { _state.update { it.copy(isUploading = false, uploadSuccess = "Document uploaded") } }
-                .onFailure { e -> _state.update { it.copy(isUploading = false, error = e.message ?: "Upload failed") } }
+                .onSuccess {
+                    _state.update {
+                        it.copy(
+                            isUploading = false,
+                            uploadSuccess = "Document uploaded"
+                        )
+                    }
+                }
+                .onFailure { e ->
+                    _state.update {
+                        it.copy(
+                            isUploading = false,
+                            error = e.message ?: "Upload failed"
+                        )
+                    }
+                }
         }
     }
 
@@ -1333,7 +1488,10 @@ class BugReportsViewModel @Inject constructor(
                 .onSuccess { _state.update { it.copy(isSubmitting = false, submitSuccess = true) } }
                 .onFailure { e ->
                     _state.update {
-                        it.copy(isSubmitting = false, error = e.message ?: "Could not file the report")
+                        it.copy(
+                            isSubmitting = false,
+                            error = e.message ?: "Could not file the report"
+                        )
                     }
                 }
         }

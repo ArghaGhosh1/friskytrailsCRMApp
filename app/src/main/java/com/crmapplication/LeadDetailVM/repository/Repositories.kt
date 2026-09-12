@@ -2143,8 +2143,8 @@ fun bookingFromCalls(
         connected = scoped.count { it.countsAsConnected },
         talkTime = formatTalkTimeClock(totalTalkSeconds),
         dailyTalkTime = formatTalkTimeClock(dailyTalkSeconds),
-        firstCall = scoped.first().dateMillis.let(::formatIso8601),
-        lastCall = scoped.last().dateMillis.let(::formatIso8601),
+        firstCall = scoped.first().dateMillis.let(::formatIso8601Utc),
+        lastCall = scoped.last().dateMillis.let(::formatIso8601Utc),
     )
 }
 
