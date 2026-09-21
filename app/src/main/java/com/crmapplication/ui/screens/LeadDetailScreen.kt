@@ -86,10 +86,17 @@ fun LeadDetailScreen(
     val listLead = leadsState.leads.find { it.id == leadId }
     val detailLead = detailState.lead
 
-    val lead = detailLead ?: listLead
+    val lead = listLead?.copy(
+        totalDial = detailLead?.totalDial ?: listLead.totalDial,
+        connected = detailLead?.connected ?: listLead.connected,
+        talkTime = detailLead?.talkTime ?: listLead.talkTime,
+        firstCall = detailLead?.firstCall ?: listLead.firstCall,
+        lastCall = detailLead?.lastCall ?: listLead.lastCall,
+    ) ?: detailLead
 
-    LaunchedEffect(lead) {
-        lead?.let { detailVm.loadLead(it) }
+
+    LaunchedEffect(leadId, listLead?.id) {
+        listLead?.let { detailVm.loadLead(it) }
     }
 
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -402,20 +409,11 @@ fun LeadDetailScreen(
                             onEdit = { editingField = LeadEditField.PERSONS },
                         )
 
-                        if (detailState.hasCallLogMatch) {
-
-                            InfoRow("Total Dials", lead.totalDial.toString())
-                            InfoRow("Connected", lead.connected.toString())
-                            InfoRow("Talk Time", lead.talkTime.ifBlank { "—" })
-                            InfoRow("First Call", formatBookingDateTime(lead.firstCall) ?: "—")
-                            InfoRow("Last Call", formatBookingDateTime(lead.lastCall) ?: "—")
-                        } else {
-                            Text(
-                                "Tap the number to see call details from this phone.",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
+                        InfoRow("Total Dials", lead.totalDial.toString())
+                        InfoRow("Connected", lead.connected.toString())
+                        InfoRow("Talk Time", lead.talkTime.ifBlank { "—" })
+                        InfoRow("First Call", formatBookingDateTime(lead.firstCall) ?: "—")
+                        InfoRow("Last Call", formatBookingDateTime(lead.lastCall) ?: "—")
                     }
                 }
             }
