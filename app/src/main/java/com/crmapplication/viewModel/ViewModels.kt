@@ -744,7 +744,6 @@ data class LeadsUiState(
                 onClosedChip || searchQuery.isNotBlank()
             }
             .filter { lead ->
-
                 when (val match = activeFilter?.statusMatch) {
                     null -> true
                     else -> lead.status.equals(match, ignoreCase = true)
@@ -769,9 +768,24 @@ data class LeadsUiState(
 
     // "All" counts only what "All" actually shows — open leads. Counting closed ones here would
     // print a number the list can never reach.
-    fun countFor(filter: LeadFilter): Int =
-        filter.statusMatch?.let { s -> leads.count { it.status.equals(s, ignoreCase = true) } }
-            ?: leads.count { !isClosedStatus(it.status) }
+    fun countFor(filter: LeadFilter): Int {
+        val match = filter.statusMatch
+
+        if (match != null) {
+            val targetKey = statusKey(match)
+
+            val statusCounts = leads
+                .groupingBy { it.status }
+                .eachCount()
+            return leads.count {
+                statusKey(it.status) == targetKey
+            }
+        }
+
+        return leads.count {
+            !isClosedStatus(it.status)
+        }
+    }
 
     /**
      * Options for a status dropdown: the server list, with [BOOKED_STATUS] guaranteed present.
