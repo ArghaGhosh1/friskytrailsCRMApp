@@ -1105,6 +1105,7 @@ data class LeadDetailUiState(
     val statusHistory: List<StatusChange> = emptyList(),
 
     val myAgentId: String? = null,
+    val agentName: String = ""
 )
 
 /**
@@ -1135,6 +1136,7 @@ class LeadDetailViewModel @Inject constructor(
     private val callLogSyncRepo: CallLogSyncRepository,
     private val callLogReader: CallLogReader,
     private val reminderScheduler: ReminderScheduler,
+    private val authRepo: AuthRepository
 ) : ViewModel() {
 
     private val _state = MutableStateFlow(LeadDetailUiState())
@@ -1154,7 +1156,7 @@ class LeadDetailViewModel @Inject constructor(
     }
 
     fun loadLead(lead: Lead) {
-        _state.update { it.copy(lead = lead, myAgentId = repo.currentAgentId()) }
+        _state.update { it.copy(lead = lead, myAgentId = repo.currentAgentId() ,agentName = authRepo.getAgentName(), ) }
         viewModelScope.launch {
             repo.observeNotes(lead.id).collect { notes ->
                 _state.update { it.copy(notes = notes) }
