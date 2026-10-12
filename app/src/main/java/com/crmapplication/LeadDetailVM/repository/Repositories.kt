@@ -529,14 +529,9 @@ class DashboardRepository @Inject constructor(
         }.timeInMillis
 
         // --- Stage 1: local-only (no network) ---
-        // Marks are re-applied on every compute, because this reads the raw call log rather than the
-        // `calls` table — the log itself cannot record that a call reached a machine.
         val allCalls = callLogReader.readAll().withVoicemailMarks(callDao.getVoicemailMarkedIds())
         val leads = leadDao.getAllLeads().first()
 
-        // Per-number assignment cutoff (earliest stamp wins if a number is shared; null =
-        // no restriction). Dashboard stays today-scoped but drops any of today's calls that
-        // predate assignment, so a lead assigned today can't pull in earlier-today calls.
         val assignedByKey: Map<String, Long?> = leads
             .mapNotNull { lead ->
                 val key = lead.phone.normalizedPhoneKey().ifEmpty { null } ?: return@mapNotNull null
@@ -545,22 +540,14 @@ class DashboardRepository @Inject constructor(
             .groupBy({ it.first }, { it.second })
             .mapValues { (_, times) -> if (times.any { it == null }) null else times.filterNotNull().min() }
 
-        // Built from the last known network values, not from nulls: those are per-agent figures that
-        // don't change between refreshes, so seeding them keeps the Monthly card steady instead of
-        // flashing "₹0 / ₹0" and "0P / 0A" on every recompute.
         val localDaily = buildDailyStats(
             allCalls, startOfDay, endOfDay, now.timeInMillis, cachedTodayStatus, assignedByKey,
         )
-        val localMonthly = buildMonthlyStats(startOfMonth, cachedPresent, cachedAbsent, cachedMetrics, leads)
-        DashboardData(daily = localDaily, monthly = localMonthly)
+        val localMonthly = buildMonthlyStats(startOfMonth, cachedPresent, cachedAbsent, cachedMetrics)   // 👈 restored
+        DashboardData(daily = localDaily, monthly = localMonthly)                                         // 👈 restored
             .also { lastData = it }
             .let { emit(it) }
 
-        // Skip the network stage if it ran moments ago. First composition triggers two full loads —
-        // `DashboardViewModel.init` calls load(), then the screen's ON_RESUME observer calls refresh()
-        // — which was six requests (metrics + attendance + monthly attendance, twice) for one screen
-        // open. The local stage above still emits, so the UI is unaffected; it now paints cached
-        // figures rather than placeholders.
         if (System.currentTimeMillis() - lastNetworkAt < NETWORK_THROTTLE_MS) return@flow
 
         // --- Stage 2: network (best-effort, all concurrent) ---
@@ -592,19 +579,18 @@ class DashboardRepository @Inject constructor(
             val absentCount = monthlyAttendance?.absent
                 ?: monthLogs.count { it.status?.trim()?.uppercase() == "A" }
 
-            val daily = buildDailyStats(allCalls, startOfDay, endOfDay, now.timeInMillis, todayStatus, assignedByKey)
-            val monthly = buildMonthlyStats(startOfMonth, presentCount, absentCount, metrics, leads)
+            val effectiveMetrics = metrics ?: cachedMetrics        // keep last good values if the call failed
 
-            // Kept so the next local stage can build with real figures instead of placeholders, and so
-            // a throttled compute doesn't lose them. Written even when a fetch returned null — that is
-            // still the current answer, and treating it as "no answer" would keep re-showing a stale one.
-            cachedMetrics = metrics
+            val daily = buildDailyStats(allCalls, startOfDay, endOfDay, now.timeInMillis, todayStatus, assignedByKey)
+            val monthly = buildMonthlyStats(startOfMonth, presentCount, absentCount, effectiveMetrics)   // 👈 restored
+
+            cachedMetrics = effectiveMetrics
             cachedPresent = presentCount
             cachedAbsent = absentCount
             cachedTodayStatus = todayStatus
             lastNetworkAt = System.currentTimeMillis()
 
-            DashboardData(daily = daily, monthly = monthly)
+            DashboardData(daily = daily, monthly = monthly)                                               // 👈 restored
                 .also { lastData = it }
                 .let { emit(it) }
         }
@@ -679,29 +665,18 @@ class DashboardRepository @Inject constructor(
         presentCount: Int,
         absentCount: Int,
         metrics: AgentMetricsDto?,
-        leads: List<LeadEntity>,
     ): MonthlyStats {
-
-        // Progress against target is now money booked, not bookings closed: "₹1,50,000 / ₹5,00,000".
-        // The sale side is summed on-device from `leads.bookedAmount` (see monthlySaleAmount) because
-        // the booking service exposes no way to ask for it; the target side is the admin's figure from
-        // the metrics API. A failed metrics call leaves the target at ₹0 rather than hiding the sale
-        // total, which the device knows regardless.
-        //
-        // `metrics.targetCompleted` is deliberately dropped: it counts bookings, so pairing it with an
-        // amount would read as a total in rupees. The Booking Count row below carries the count.
-        val monthlySale = monthlySaleAmount(leads, startOfMonth)
-        val monthlyTarget = "${formatIndianAmount(monthlySale)} / " +
-            formatIndianAmount((metrics?.monthlyTarget ?: 0).toLong())
+        // The backend rolls the top-level fields over to the current month, so they are the source of truth.
+        val target = metrics?.monthlyTarget ?: 0
+        val completed = metrics?.targetCompleted ?: 0
+        val bookings = metrics?.bookingCount ?: 0
+        val bookingTarget = metrics?.targetBookingCount ?: 0
 
         return MonthlyStats(
             month = formatMonthLabel(startOfMonth),
-            monthlyTarget = monthlyTarget,
-            // Numerator is this month's bookings, so it resets with the month like the amount above.
-            // The denominator is leads on hand right now, which is NOT month-scoped — it's "of the
-            // leads you're holding, this many became bookings this month".
-            bookingCount = "${monthlyBookingCount(leads, startOfMonth)} / ${leads.size}",
-            totalSaleAmount = formatIndianAmount(monthlySale),
+            monthlyTarget = "${formatIndianAmount(completed.toLong())} / ${formatIndianAmount(target.toLong())}",
+            bookingCount = "$bookings / $bookingTarget",
+            totalSaleAmount = formatIndianAmount(completed.toLong()),
             attendance = "${presentCount}P / ${absentCount}A",
         )
     }
