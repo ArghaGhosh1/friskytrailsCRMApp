@@ -908,10 +908,12 @@ class LeadsRepository @Inject constructor(
             if (savedDueDates[entity.id] != resolved) dueDateStore.set(entity.id, resolved)
         }
 
-        dtos.forEach { dto ->
-            val id = dto.id ?: dto.mongoId ?: dto.leadId?.toString() ?: dto.phone.orEmpty()
-            if (id.isNotBlank()) reconcileNotes(id, dto.notes)
-        }
+          dtos.forEach { dto ->
+              val id = dto.id ?: dto.mongoId ?: dto.leadId?.toString() ?: dto.phone.orEmpty()
+              // The list endpoint may send an empty notes array; trusting it would wipe every note on the
+              // phone. The lead screen pulls the authoritative copy itself via refreshLeadNotes.
+              if (id.isNotBlank() && !dto.notes.isNullOrEmpty()) reconcileNotes(id, dto.notes)
+          }
         lastSyncAt = System.currentTimeMillis()
       }
     }
@@ -943,24 +945,36 @@ class LeadsRepository @Inject constructor(
                     imageUrl = imageUrl?.takeIf { it.isNotBlank() },
                 )
             )
-            val updated = try {
-                leadsApi.addNote(
-                    id = leadId,
-                    authorization = session.getToken()?.toBearerOrNull(),
-                    body = AddLeadNoteRequest(text = text, imageUrl = imageUrl?.takeIf { it.isNotBlank() }),
-                )
-            } catch (e: Throwable) {
-                // Roll the optimistic row back. reconcileNotes only clears server-side ids
-                // (`id NOT LIKE '%-%'`), and this id is a UUID, so without this the unsent note
-                // would sit in "Previous Notes" forever and read as saved when it never reached
-                // the server. Dropping it keeps the list honest; the composer keeps the text so
-                // the agent can send again.
-                noteDao.deleteNoteById(optimisticId)
-                throw e
-            }
 
-            reconcileNotes(leadId, updated.notes)
-            noteDao.deleteNoteById(optimisticId)
+            // Same lock as syncLeads: a background refresh can no longer start before this save and
+            // finish after it, which put the old notes list back and made the new note vanish.
+            syncMutex.withLock {
+                val updated = try {
+                    leadsApi.addNote(
+                        id = leadId,
+                        authorization = session.getToken()?.toBearerOrNull(),
+                        body = AddLeadNoteRequest(text = text, imageUrl = imageUrl?.takeIf { it.isNotBlank() }),
+                    )
+                } catch (e: Throwable) {
+                    // Roll the optimistic row back. reconcileNotes only clears server-side ids
+                    // (`id NOT LIKE '%-%'`), and this id is a UUID, so without this the unsent note
+                    // would sit in "Previous Notes" forever and read as saved when it never reached
+                    // the server. Dropping it keeps the list honest; the composer keeps the text so
+                    // the agent can send again.
+                    noteDao.deleteNoteById(optimisticId)
+                    throw e
+                }
+
+                val serverNotes = updated.notes
+                if (serverNotes != null) {
+                    reconcileNotes(leadId, serverNotes)
+                } else {
+                    // The server saved the note but didn't send the list back. Pull it instead of
+                    // deleting the temporary row and leaving the agent with a note that "disappeared".
+                    runCatching { pullNotes(leadId) }
+                }
+                noteDao.deleteNoteById(optimisticId)
+            }
         }
     }.mapApiError()
 
@@ -979,6 +993,14 @@ class LeadsRepository @Inject constructor(
     }.mapApiError()
 
     suspend fun refreshLeadNotes(leadId: String): Result<Unit> = runCatching {
+        val token = session.getToken()?.takeIf { it.isNotBlank() }
+            ?: error("Not logged in — cannot refresh notes.")
+        val dto = leadsApi.getLead(id = leadId, authorization = token.toBearerOrNull())
+        reconcileNotes(leadId, dto.notes)
+    }
+
+    /** Fetches one lead's notes and replaces the stored server copy. Caller must hold [syncMutex]. */
+    private suspend fun pullNotes(leadId: String) {
         val token = session.getToken()?.takeIf { it.isNotBlank() }
             ?: error("Not logged in — cannot refresh notes.")
         val dto = leadsApi.getLead(id = leadId, authorization = token.toBearerOrNull())
