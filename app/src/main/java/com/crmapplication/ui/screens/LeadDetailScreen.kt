@@ -150,6 +150,8 @@ fun LeadDetailScreen(
     var previewImageUrl by remember { mutableStateOf<String?>(null) }
     var pendingDownloadUrl by remember { mutableStateOf<String?>(null) }
 
+    val agentName = detailState.agentName
+
     val callLogPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
@@ -314,21 +316,19 @@ fun LeadDetailScreen(
                         }) {
                             Text("📞", fontSize = 20.sp)
                         }
-
                         IconButton(onClick = {
                             lead?.phone?.let { phone ->
+                                val message = buildWhatsAppMessage(agentName)
                                 val hasWhatsApp = context.isPackageInstalled(WHATSAPP_PKG)
                                 val hasWhatsAppBusiness = context.isPackageInstalled(WHATSAPP_BUSINESS_PKG)
                                 when {
                                     hasWhatsApp && hasWhatsAppBusiness -> showWhatsAppSheet = true
-                                    hasWhatsApp -> context.launchWhatsApp(phone, WHATSAPP_PKG)
-                                    hasWhatsAppBusiness -> context.launchWhatsApp(phone, WHATSAPP_BUSINESS_PKG)
-                                    else -> context.launchWhatsApp(phone, null)
+                                    hasWhatsApp -> context.launchWhatsApp(phone, WHATSAPP_PKG, message)
+                                    hasWhatsAppBusiness -> context.launchWhatsApp(phone, WHATSAPP_BUSINESS_PKG, message)
+                                    else -> context.launchWhatsApp(phone, null, message)
                                 }
                             }
-                        }) {
-                            Text("💬", fontSize = 20.sp)
-                        }
+                        }) { Text("💬", fontSize = 20.sp) }
                     }
                 )
                 if (detailState.isLoading) {
@@ -732,7 +732,7 @@ fun LeadDetailScreen(
                 leadingContent = { AppIcon(icon = whatsAppIcon, fallback = "💬") },
                 modifier = Modifier.clickable {
                     showWhatsAppSheet = false
-                    lead?.phone?.let { context.launchWhatsApp(it, WHATSAPP_PKG) }
+                    lead?.phone?.let { context.launchWhatsApp(it, WHATSAPP_PKG, buildWhatsAppMessage(agentName)) }
                 },
             )
             ListItem(
@@ -740,8 +740,7 @@ fun LeadDetailScreen(
                 leadingContent = { AppIcon(icon = whatsAppBusinessIcon, fallback = "💼") },
                 modifier = Modifier.clickable {
                     showWhatsAppSheet = false
-                    lead?.phone?.let { context.launchWhatsApp(it, WHATSAPP_BUSINESS_PKG) }
-                },
+                    lead?.phone?.let { context.launchWhatsApp(it, WHATSAPP_BUSINESS_PKG, buildWhatsAppMessage(agentName)) }                },
             )
             Spacer(Modifier.height(16.dp))
         }
@@ -1181,6 +1180,56 @@ private fun Context.launchWhatsApp(phone: String, packageName: String?) {
     } catch (e: Exception) {
         startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
     }
+}
+
+private fun Context.launchWhatsApp(phone: String, packageName: String?, message: String) {
+    val baseUrl = formatWhatsAppUrl(phone)
+    val uri = Uri.parse(baseUrl)
+        .buildUpon()
+        .appendQueryParameter("text", message)   // encodes the text for you
+        .build()
+
+    val intent = Intent(Intent.ACTION_VIEW, uri)
+    if (packageName != null) intent.setPackage(packageName)
+    try {
+        startActivity(intent)
+    } catch (e: Exception) {
+        startActivity(Intent(Intent.ACTION_VIEW, uri))
+    }
+}
+
+private const val FRISKY_PHONE = "+91-89793-33454"
+private const val FRISKY_WEBSITE = "www.friskytrails.in"
+
+private fun buildWhatsAppMessage(agentName: String): String {
+    val name = agentName.trim().ifBlank { "FriskyTrails Team" }
+
+    return """
+👋 *Greetings from FriskyTrails!*
+
+Hello *Sir/Ma’am!* 😊
+
+I'm *$name*, your Travel Advisor at *FriskyTrails*.
+
+Thank you for showing interest in our travel packages! ✨🌍
+
+To help us suggest the best package for you, could you please share a few details?
+
+📝 *Name:*
+📍 *Departure City:*
+👥 *Total Travellers:*
+📅 *Preferred Travel Date:*
+🏔️ *Destination You're Interested In:*
+
+Once we have these details, we'll help you plan your perfect getaway! ❤️
+
+Looking forward to planning an amazing trip with you.
+
+*Regards,*
+*$name | Travel Advisor*
+📞 *$FRISKY_PHONE*
+🌐 $FRISKY_WEBSITE
+""".trimIndent()
 }
 
 private fun Context.loadAppIcon(packageName: String): ImageBitmap? = try {
