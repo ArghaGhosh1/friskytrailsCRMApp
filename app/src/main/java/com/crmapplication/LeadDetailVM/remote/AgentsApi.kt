@@ -7,10 +7,21 @@ import retrofit2.http.PUT
 import retrofit2.http.Path
 import retrofit2.http.Query
 
+data class MonthlyMetricsDto(
+    val month: String? = null,
+    val monthlyTarget: Int? = null,
+    val targetCompleted: Int? = null,
+    val bookingCount: Int? = null,
+    val targetBookingCount: Int? = null,
+)
+
 data class AgentMetricsDto(
     val monthlyTarget: Int? = null,
     val targetCompleted: Int? = null,
+    val bookingCount: Int? = null,
+    val targetBookingCount: Int? = null,
     val attendance: String? = null,
+    val historicalMetrics: List<MonthlyMetricsDto>? = null,
 )
 
 data class UpdateMetricsRequest(
