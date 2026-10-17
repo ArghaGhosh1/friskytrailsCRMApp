@@ -80,4 +80,6 @@
     <string name="call_history_voicemail_checkbox">Went to voicemail</string>
     <string name="call_history_voicemail_badge">Voicemail</string>
     <string name="call_history_voicemail_hint">Tick any call that went to voicemail — its time is left out of your talk time.</string>
+
+    <string name="booking_field_gst_amount">GST Amount (₹) (Included in Total)</string>
 </resources>
