@@ -12,11 +12,14 @@ import android.net.Uri
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
@@ -25,10 +28,13 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -71,7 +77,7 @@ import java.util.*
 /** How often to re-pull this lead while the screen is in front of the agent. */
 private const val DETAIL_POLL_INTERVAL_MS = 25_000L
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun LeadDetailScreen(
     leadId: String,
@@ -151,6 +157,40 @@ fun LeadDetailScreen(
     var pendingDownloadUrl by remember { mutableStateOf<String?>(null) }
 
     val agentName = detailState.agentName
+
+    val haptics = LocalHapticFeedback.current
+
+    /** Set by a long-press, so the greeting survives the "which WhatsApp?" sheet when both are installed. */
+    var whatsAppForceGreeting by remember { mutableStateOf(false) }
+
+    /** Opens the chat. The greeting goes in only the first time for this lead, or whenever it is forced. */
+    fun openWhatsApp(phone: String, packageName: String?, forceGreeting: Boolean) {
+        val leadId = lead?.id ?: return
+        val withGreeting = forceGreeting || !detailVm.whatsAppGreetingSent(leadId)
+        val opened = context.launchWhatsApp(
+            phone = phone,
+            packageName = packageName,
+            message = if (withGreeting) buildWhatsAppMessage(agentName) else null,
+        )
+        // Marked only when something really opened, so a failed launch doesn't use up the first greeting.
+        if (withGreeting && opened) detailVm.markWhatsAppGreetingSent(leadId)
+    }
+
+    /** Tap (forceGreeting = false) and long-press (true) both come through here. */
+    fun startWhatsApp(forceGreeting: Boolean) {
+        val phone = lead?.phone ?: return
+        val hasWhatsApp = context.isPackageInstalled(WHATSAPP_PKG)
+        val hasWhatsAppBusiness = context.isPackageInstalled(WHATSAPP_BUSINESS_PKG)
+        when {
+            hasWhatsApp && hasWhatsAppBusiness -> {
+                whatsAppForceGreeting = forceGreeting
+                showWhatsAppSheet = true
+            }
+            hasWhatsApp -> openWhatsApp(phone, WHATSAPP_PKG, forceGreeting)
+            hasWhatsAppBusiness -> openWhatsApp(phone, WHATSAPP_BUSINESS_PKG, forceGreeting)
+            else -> openWhatsApp(phone, null, forceGreeting)
+        }
+    }
 
     val callLogPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -316,19 +356,21 @@ fun LeadDetailScreen(
                         }) {
                             Text("📞", fontSize = 20.sp)
                         }
-                        IconButton(onClick = {
-                            lead?.phone?.let { phone ->
-                                val message = buildWhatsAppMessage(agentName)
-                                val hasWhatsApp = context.isPackageInstalled(WHATSAPP_PKG)
-                                val hasWhatsAppBusiness = context.isPackageInstalled(WHATSAPP_BUSINESS_PKG)
-                                when {
-                                    hasWhatsApp && hasWhatsAppBusiness -> showWhatsAppSheet = true
-                                    hasWhatsApp -> context.launchWhatsApp(phone, WHATSAPP_PKG, message)
-                                    hasWhatsAppBusiness -> context.launchWhatsApp(phone, WHATSAPP_BUSINESS_PKG, message)
-                                    else -> context.launchWhatsApp(phone, null, message)
-                                }
-                            }
-                        }) { Text("💬", fontSize = 20.sp) }
+                        Box(
+                            modifier = Modifier
+                                .size(48.dp)                       // same size as an IconButton
+                                .clip(CircleShape)
+                                .combinedClickable(
+                                    onClick = { startWhatsApp(forceGreeting = false) },
+                                    onLongClick = {
+                                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                        startWhatsApp(forceGreeting = true)
+                                    },
+                                ),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text("💬", fontSize = 20.sp)
+                        }
                     }
                 )
                 if (detailState.isLoading) {
@@ -732,7 +774,7 @@ fun LeadDetailScreen(
                 leadingContent = { AppIcon(icon = whatsAppIcon, fallback = "💬") },
                 modifier = Modifier.clickable {
                     showWhatsAppSheet = false
-                    lead?.phone?.let { context.launchWhatsApp(it, WHATSAPP_PKG, buildWhatsAppMessage(agentName)) }
+                    lead?.phone?.let { openWhatsApp(it, WHATSAPP_PKG, whatsAppForceGreeting) }
                 },
             )
             ListItem(
@@ -740,7 +782,8 @@ fun LeadDetailScreen(
                 leadingContent = { AppIcon(icon = whatsAppBusinessIcon, fallback = "💼") },
                 modifier = Modifier.clickable {
                     showWhatsAppSheet = false
-                    lead?.phone?.let { context.launchWhatsApp(it, WHATSAPP_BUSINESS_PKG, buildWhatsAppMessage(agentName)) }                },
+                    lead?.phone?.let { openWhatsApp(it, WHATSAPP_BUSINESS_PKG, whatsAppForceGreeting) }
+                },
             )
             Spacer(Modifier.height(16.dp))
         }
@@ -1171,30 +1214,26 @@ private fun Context.isPackageInstalled(packageName: String): Boolean =
         false
     }
 
-private fun Context.launchWhatsApp(phone: String, packageName: String?) {
-    val url = formatWhatsAppUrl(phone)
-    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
-    if (packageName != null) intent.setPackage(packageName)
-    try {
-        startActivity(intent)
-    } catch (e: Exception) {
-        startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
-    }
-}
 
-private fun Context.launchWhatsApp(phone: String, packageName: String?, message: String) {
-    val baseUrl = formatWhatsAppUrl(phone)
-    val uri = Uri.parse(baseUrl)
-        .buildUpon()
-        .appendQueryParameter("text", message)   // encodes the text for you
-        .build()
+private fun Context.launchWhatsApp(phone: String, packageName: String?, message: String?): Boolean {
+    val builder = Uri.parse(formatWhatsAppUrl(phone)).buildUpon()
+    // Text is added only when there is one, so a repeat tap opens an empty chat.
+    if (!message.isNullOrBlank()) builder.appendQueryParameter("text", message)   // encodes the text for you
+    val uri = builder.build()
 
     val intent = Intent(Intent.ACTION_VIEW, uri)
     if (packageName != null) intent.setPackage(packageName)
-    try {
+    return try {
         startActivity(intent)
+        true
     } catch (e: Exception) {
-        startActivity(Intent(Intent.ACTION_VIEW, uri))
+        // The chosen WhatsApp isn't installed: fall back to whatever can open the link.
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, uri))
+            true
+        } catch (e2: Exception) {
+            false      // nothing could open it
+        }
     }
 }
 

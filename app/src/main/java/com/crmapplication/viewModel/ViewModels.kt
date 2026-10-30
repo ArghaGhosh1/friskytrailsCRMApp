@@ -32,6 +32,7 @@ import com.crmapplication.calllog.CallLogReader
 import com.crmapplication.calllog.normalizedPhoneKey
 import com.crmapplication.notification.ReminderScheduler
 import com.crmapplication.utils.ThemeManager
+import com.crmapplication.utils.WhatsAppIntroStore
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.FlowPreview
@@ -1136,7 +1137,8 @@ class LeadDetailViewModel @Inject constructor(
     private val callLogSyncRepo: CallLogSyncRepository,
     private val callLogReader: CallLogReader,
     private val reminderScheduler: ReminderScheduler,
-    private val authRepo: AuthRepository
+    private val authRepo: AuthRepository,
+    private val whatsAppIntro: WhatsAppIntroStore,
 ) : ViewModel() {
 
     private val _state = MutableStateFlow(LeadDetailUiState())
@@ -1154,6 +1156,13 @@ class LeadDetailViewModel @Inject constructor(
                 .collect { _state.value.lead?.phone?.let { refreshCallLogMatch(it) } }
         }
     }
+
+    /** True once this agent has opened WhatsApp with the greeting for this lead. */
+    fun whatsAppGreetingSent(leadId: String): Boolean =
+        whatsAppIntro.wasSent(repo.currentAgentId(), leadId)
+
+    fun markWhatsAppGreetingSent(leadId: String) =
+        whatsAppIntro.markSent(repo.currentAgentId(), leadId)
 
     fun loadLead(lead: Lead) {
         _state.update { it.copy(lead = lead, myAgentId = repo.currentAgentId() ,agentName = authRepo.getAgentName(), ) }
