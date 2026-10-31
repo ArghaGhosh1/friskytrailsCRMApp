@@ -89,6 +89,7 @@ import java.util.Calendar
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
@@ -348,8 +349,12 @@ class DashboardRepository @Inject constructor(
     // Only for the agent's voicemail marks: the Dashboard computes from the device call log, but that
     // log can't express "reached a machine", so the marks have to come from here.
     private val callDao: CallDao,
+    private val attendanceRepo: AttendanceRepository,     // new
     sessionCleaner: SessionCleaner,
 ) : SessionScopedState {
+
+    /** Today's attendance for the Dashboard card. */
+    val attendance: StateFlow<AttendanceSnapshot?> get() = attendanceRepo.snapshot
 
     init {
         // This Singleton outlives a logout, so its caches have to be told to forget the agent.
@@ -374,6 +379,7 @@ class DashboardRepository @Inject constructor(
     @Volatile private var cachedMetrics: AgentMetricsDto? = null
     @Volatile private var cachedPresent: Int = 0
     @Volatile private var cachedAbsent: Int = 0
+    @Volatile private var cachedHalf: Int = 0
 
     /** Admin-set "P"/"A" for today, from the attendance log or metrics. Null = not known yet. */
     @Volatile private var cachedTodayStatus: String? = null
@@ -459,20 +465,7 @@ class DashboardRepository @Inject constructor(
      * a failed push retries on the next refresh. Never surfaces errors — attendance is derived,
      * not user-entered, so a failure here must not break the dashboard.
      */
-    private suspend fun syncTodayAttendance(
-        allCalls: List<CallLogEntry>,
-        startOfDay: Long,
-        endOfDay: Long,
-    ) {
-        val today = formatApiDate(startOfDay)
-        if (lastAttendancePush == today) return
 
-        val presentToday = allCalls.any { it.dateMillis in startOfDay until endOfDay }
-        if (!presentToday) return
-
-        updateMetrics(attendance = "P", attendanceDate = today)
-            .onSuccess { lastAttendancePush = today }
-    }
 
     suspend fun updateMetrics(
         attendance: String? = null,
@@ -513,95 +506,79 @@ class DashboardRepository @Inject constructor(
 
         val now = Calendar.getInstance()
         val startOfDay = (now.clone() as Calendar).apply {
-            set(Calendar.HOUR_OF_DAY, 0)
-            set(Calendar.MINUTE, 0)
-            set(Calendar.SECOND, 0)
-            set(Calendar.MILLISECOND, 0)
+            set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
         }.timeInMillis
         val endOfDay = startOfDay + DAY_MILLIS
-
         val startOfMonth = (now.clone() as Calendar).apply {
             set(Calendar.DAY_OF_MONTH, 1)
-            set(Calendar.HOUR_OF_DAY, 0)
-            set(Calendar.MINUTE, 0)
-            set(Calendar.SECOND, 0)
-            set(Calendar.MILLISECOND, 0)
+            set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
         }.timeInMillis
 
-        // --- Stage 1: local-only (no network) ---
-        // Marks are re-applied on every compute, because this reads the raw call log rather than the
-        // `calls` table — the log itself cannot record that a call reached a machine.
+        // --- Stage 1: local only ---
         val allCalls = callLogReader.readAll().withVoicemailMarks(callDao.getVoicemailMarkedIds())
         val leads = leadDao.getAllLeads().first()
+        val assignedByKey = assignedCutoffs(leads)
+        val auth = resolveAgentAuth()
 
-        // Per-number assignment cutoff (earliest stamp wins if a number is shared; null =
-        // no restriction). Dashboard stays today-scoped but drops any of today's calls that
-        // predate assignment, so a lead assigned today can't pull in earlier-today calls.
-        val assignedByKey: Map<String, Long?> = leads
-            .mapNotNull { lead ->
-                val key = lead.phone.normalizedPhoneKey().ifEmpty { null } ?: return@mapNotNull null
-                key to lead.assignedAt
-            }
-            .groupBy({ it.first }, { it.second })
-            .mapValues { (_, times) -> if (times.any { it == null }) null else times.filterNotNull().min() }
+        // Today's talk time decides today's attendance, straight from the phone's call log.
+        val talkSeconds = leadCallsToday(allCalls, startOfDay, endOfDay, assignedByKey)
+            .sumOf { it.talkTimeSeconds.toLong() }
+        val localAttendance = attendanceRepo.update(talkSeconds, auth?.id)
 
-        // Built from the last known network values, not from nulls: those are per-agent figures that
-        // don't change between refreshes, so seeding them keeps the Monthly card steady instead of
-        // flashing "₹0 / ₹0" and "0P / 0A" on every recompute.
         val localDaily = buildDailyStats(
-            allCalls, startOfDay, endOfDay, now.timeInMillis, cachedTodayStatus, assignedByKey,
+            allCalls, startOfDay, endOfDay, now.timeInMillis, localAttendance.status, assignedByKey,
         )
-        val localMonthly = buildMonthlyStats(startOfMonth, cachedPresent, cachedAbsent, cachedMetrics, leads)
+        val localMonthly = buildMonthlyStats(startOfMonth, cachedPresent, cachedHalf, cachedAbsent, cachedMetrics)
         DashboardData(daily = localDaily, monthly = localMonthly)
             .also { lastData = it }
             .let { emit(it) }
 
-        // Skip the network stage if it ran moments ago. First composition triggers two full loads —
-        // `DashboardViewModel.init` calls load(), then the screen's ON_RESUME observer calls refresh()
-        // — which was six requests (metrics + attendance + monthly attendance, twice) for one screen
-        // open. The local stage above still emits, so the UI is unaffected; it now paints cached
-        // figures rather than placeholders.
         if (System.currentTimeMillis() - lastNetworkAt < NETWORK_THROTTLE_MS) return@flow
 
-        // --- Stage 2: network (best-effort, all concurrent) ---
+        // --- Stage 2: network (best effort, all at once) ---
         coroutineScope {
             val metricsDeferred = async { fetchAgentMetrics() }
             val attendanceLogsDeferred = async { fetchAttendanceLogs() }
-            val monthlyAttendanceDeferred = async {
+            val monthlyDeferred = async {
                 fetchMonthlyAttendance(
                     month = now.get(Calendar.MONTH) + 1,
                     year = now.get(Calendar.YEAR),
                 )
             }
-            launch { syncTodayAttendance(allCalls, startOfDay, endOfDay) }
+            val serverTodayDeferred = async {
+                if (auth != null) attendanceRepo.loadServerToday(auth.id, auth.bearer)
+            }
 
             val metrics = metricsDeferred.await()
             val attendanceLogs = attendanceLogsDeferred.await()
-            val monthlyAttendance = monthlyAttendanceDeferred.await()
+            val monthlyAttendance = monthlyDeferred.await()
+            serverTodayDeferred.await()
 
-            val todayKey = formatApiDate(startOfDay)
-            val monthPrefix = todayKey.take(7)
+            // Recompute with whatever the server held, then send the status if it has gone up.
+            attendanceRepo.update(talkSeconds, auth?.id)
+            if (auth != null) attendanceRepo.pushIfRaised(auth.id, auth.bearer)
+            val finalStatus = attendanceRepo.snapshot.value?.status ?: localAttendance.status
 
-            val todayStatus = attendanceLogs.firstOrNull { it.date == todayKey }
-                ?.status?.trim()?.uppercase()
-                ?: metrics?.attendance?.trim()?.uppercase()
-
+            // Monthly P / A / H from the server; the old admin-set log is only a fallback.
+            val monthPrefix = formatApiDate(startOfDay).take(7)
             val monthLogs = attendanceLogs.filter { it.date.orEmpty().startsWith(monthPrefix) }
-            val presentCount = monthlyAttendance?.present
-                ?: monthLogs.count { it.status?.trim()?.uppercase() == "P" }
+            val presentCount = monthlyAttendance?.fullDay ?: monthlyAttendance?.present
+            ?: monthLogs.count { it.status?.trim()?.uppercase() == "P" }
+            val halfCount = monthlyAttendance?.halfDay ?: 0
             val absentCount = monthlyAttendance?.absent
                 ?: monthLogs.count { it.status?.trim()?.uppercase() == "A" }
 
-            val daily = buildDailyStats(allCalls, startOfDay, endOfDay, now.timeInMillis, todayStatus, assignedByKey)
-            val monthly = buildMonthlyStats(startOfMonth, presentCount, absentCount, metrics, leads)
+            val effectiveMetrics = metrics ?: cachedMetrics      // a failed call must not blank the card
 
-            // Kept so the next local stage can build with real figures instead of placeholders, and so
-            // a throttled compute doesn't lose them. Written even when a fetch returned null — that is
-            // still the current answer, and treating it as "no answer" would keep re-showing a stale one.
-            cachedMetrics = metrics
+            val daily = buildDailyStats(allCalls, startOfDay, endOfDay, now.timeInMillis, finalStatus, assignedByKey)
+            val monthly = buildMonthlyStats(startOfMonth, presentCount, halfCount, absentCount, effectiveMetrics)
+
+            cachedMetrics = effectiveMetrics
             cachedPresent = presentCount
+            cachedHalf = halfCount
             cachedAbsent = absentCount
-            cachedTodayStatus = todayStatus
             lastNetworkAt = System.currentTimeMillis()
 
             DashboardData(daily = daily, monthly = monthly)
@@ -609,6 +586,45 @@ class DashboardRepository @Inject constructor(
                 .let { emit(it) }
         }
     }.flowOn(Dispatchers.IO)
+
+    private fun assignedCutoffs(leads: List<LeadEntity>): Map<String, Long?> = leads
+        .mapNotNull { lead ->
+            val key = lead.phone.normalizedPhoneKey().ifEmpty { null } ?: return@mapNotNull null
+            key to lead.assignedAt
+        }
+        .groupBy({ it.first }, { it.second })
+        .mapValues { (_, times) -> if (times.any { it == null }) null else times.filterNotNull().min() }
+
+    /** Today's calls to the agent's own leads, oldest first. Shared by the Dashboard stats and attendance. */
+    private fun leadCallsToday(
+        allCalls: List<CallLogEntry>,
+        startOfDay: Long,
+        endOfDay: Long,
+        assignedByKey: Map<String, Long?>,
+    ): List<CallLogEntry> = allCalls
+        .filter { call ->
+            val key = call.number.normalizedPhoneKey()
+            if (!assignedByKey.containsKey(key)) return@filter false
+            val assignedAt = assignedByKey[key]
+            assignedAt == null || call.dateMillis >= assignedAt
+        }
+        .filter { it.dateMillis in startOfDay until endOfDay }
+        .sortedBy { it.dateMillis }
+
+    /** Background path (the call-sync job): works out today's talk time and sends a raised status, without building the dashboard. */
+    suspend fun syncAttendanceOnly() {
+        if (!callLogReader.hasPermission()) return
+        val auth = resolveAgentAuth() ?: return
+        val startOfDay = startOfDayMillis(System.currentTimeMillis())
+        val allCalls = callLogReader.readAll().withVoicemailMarks(callDao.getVoicemailMarkedIds())
+        val assignedByKey = assignedCutoffs(leadDao.getAllLeads().first())
+        val talk = leadCallsToday(allCalls, startOfDay, startOfDay + DAY_MILLIS, assignedByKey)
+            .sumOf { it.talkTimeSeconds.toLong() }
+
+        attendanceRepo.loadServerToday(auth.id, auth.bearer)
+        attendanceRepo.update(talk, auth.id)
+        attendanceRepo.pushIfRaised(auth.id, auth.bearer)
+    }
 
     private fun buildDailyStats(
         allCalls: List<CallLogEntry>,
@@ -621,16 +637,7 @@ class DashboardRepository @Inject constructor(
 
         // A call belongs to a lead only if it's to an assigned number AND at/after that lead's
         // assignment cutoff (null cutoff = no restriction). Excludes a prior owner's pre-assignment calls.
-        val leadCalls = allCalls.filter { call ->
-            val key = call.number.normalizedPhoneKey()
-            if (!assignedByKey.containsKey(key)) return@filter false
-            val assignedAt = assignedByKey[key]
-            assignedAt == null || call.dateMillis >= assignedAt
-        }
-
-        val today = leadCalls
-            .filter { it.dateMillis in startOfDay until endOfDay }
-            .sortedBy { it.dateMillis }
+        val today = leadCallsToday(allCalls, startOfDay, endOfDay, assignedByKey)
 
         // Idle = how long the agent has been off the phone right now: last call ended → now.
         val idleSeconds = idleSecondsSinceLastCall(today, nowMillis)
@@ -667,8 +674,10 @@ class DashboardRepository @Inject constructor(
             idleTime = idleSeconds?.let(::formatIdleTime) ?: "—",
 
             attendance = when (todayStatus) {
-                "P" -> "Present"
+                "P" -> "Full Day"
+                "H" -> "Half Day"
                 "A" -> "Absent"
+                "WO" -> "Week Off"
                 else -> "—"
             },
         )
@@ -677,32 +686,22 @@ class DashboardRepository @Inject constructor(
     private fun buildMonthlyStats(
         startOfMonth: Long,
         presentCount: Int,
+        halfCount: Int,
         absentCount: Int,
         metrics: AgentMetricsDto?,
-        leads: List<LeadEntity>,
     ): MonthlyStats {
-
-        // Progress against target is now money booked, not bookings closed: "₹1,50,000 / ₹5,00,000".
-        // The sale side is summed on-device from `leads.bookedAmount` (see monthlySaleAmount) because
-        // the booking service exposes no way to ask for it; the target side is the admin's figure from
-        // the metrics API. A failed metrics call leaves the target at ₹0 rather than hiding the sale
-        // total, which the device knows regardless.
-        //
-        // `metrics.targetCompleted` is deliberately dropped: it counts bookings, so pairing it with an
-        // amount would read as a total in rupees. The Booking Count row below carries the count.
-        val monthlySale = monthlySaleAmount(leads, startOfMonth)
-        val monthlyTarget = "${formatIndianAmount(monthlySale)} / " +
-            formatIndianAmount((metrics?.monthlyTarget ?: 0).toLong())
+        val target = metrics?.monthlyTarget ?: 0
+        val completed = metrics?.targetCompleted ?: 0
+        val bookings = metrics?.bookingCount ?: 0
+        val bookingTarget = metrics?.targetBookingCount ?: 0
 
         return MonthlyStats(
             month = formatMonthLabel(startOfMonth),
-            monthlyTarget = monthlyTarget,
-            // Numerator is this month's bookings, so it resets with the month like the amount above.
-            // The denominator is leads on hand right now, which is NOT month-scoped — it's "of the
-            // leads you're holding, this many became bookings this month".
-            bookingCount = "${monthlyBookingCount(leads, startOfMonth)} / ${leads.size}",
-            totalSaleAmount = formatIndianAmount(monthlySale),
-            attendance = "${presentCount}P / ${absentCount}A",
+            monthlyTarget = "${formatIndianAmount(completed.toLong())} / ${formatIndianAmount(target.toLong())}",
+            bookingCount = "$bookings / $bookingTarget",
+            totalSaleAmount = formatIndianAmount(completed.toLong()),
+            // Full days / absent / half days, finished days only. Today is the progress bar.
+            attendance = "${presentCount}P / ${absentCount}A / ${halfCount}H",
         )
     }
 
@@ -833,6 +832,14 @@ class LeadsRepository @Inject constructor(
         list.map { it.toDomain() }
     }
 
+    /** Origin and destination for one lead, read straight from the server (display only, not stored). */
+    suspend fun fetchLeadRoute(leadId: String): Result<Pair<String, String>> = runCatching {
+        val token = session.getToken()?.takeIf { it.isNotBlank() }
+            ?: error("Not logged in.")
+        val dto = leadsApi.getLead(id = leadId, authorization = token.toBearerOrNull())
+        dto.origin.orEmpty().trim() to dto.destination.orEmpty().trim()
+    }.mapApiError()
+
     fun observeNotes(leadId: String): Flow<List<Note>> = noteDao.getNotesForLead(leadId).map { list ->
         list.map { it.toDomain() }
     }
@@ -933,10 +940,12 @@ class LeadsRepository @Inject constructor(
             if (savedDueDates[entity.id] != resolved) dueDateStore.set(entity.id, resolved)
         }
 
-        dtos.forEach { dto ->
-            val id = dto.id ?: dto.mongoId ?: dto.leadId?.toString() ?: dto.phone.orEmpty()
-            if (id.isNotBlank()) reconcileNotes(id, dto.notes)
-        }
+          dtos.forEach { dto ->
+              val id = dto.id ?: dto.mongoId ?: dto.leadId?.toString() ?: dto.phone.orEmpty()
+              // The list endpoint may send an empty notes array; trusting it would wipe every note on the
+              // phone. The lead screen pulls the authoritative copy itself via refreshLeadNotes.
+              if (id.isNotBlank() && !dto.notes.isNullOrEmpty()) reconcileNotes(id, dto.notes)
+          }
         lastSyncAt = System.currentTimeMillis()
       }
     }
@@ -968,24 +977,36 @@ class LeadsRepository @Inject constructor(
                     imageUrl = imageUrl?.takeIf { it.isNotBlank() },
                 )
             )
-            val updated = try {
-                leadsApi.addNote(
-                    id = leadId,
-                    authorization = session.getToken()?.toBearerOrNull(),
-                    body = AddLeadNoteRequest(text = text, imageUrl = imageUrl?.takeIf { it.isNotBlank() }),
-                )
-            } catch (e: Throwable) {
-                // Roll the optimistic row back. reconcileNotes only clears server-side ids
-                // (`id NOT LIKE '%-%'`), and this id is a UUID, so without this the unsent note
-                // would sit in "Previous Notes" forever and read as saved when it never reached
-                // the server. Dropping it keeps the list honest; the composer keeps the text so
-                // the agent can send again.
-                noteDao.deleteNoteById(optimisticId)
-                throw e
-            }
 
-            reconcileNotes(leadId, updated.notes)
-            noteDao.deleteNoteById(optimisticId)
+            // Same lock as syncLeads: a background refresh can no longer start before this save and
+            // finish after it, which put the old notes list back and made the new note vanish.
+            syncMutex.withLock {
+                val updated = try {
+                    leadsApi.addNote(
+                        id = leadId,
+                        authorization = session.getToken()?.toBearerOrNull(),
+                        body = AddLeadNoteRequest(text = text, imageUrl = imageUrl?.takeIf { it.isNotBlank() }),
+                    )
+                } catch (e: Throwable) {
+                    // Roll the optimistic row back. reconcileNotes only clears server-side ids
+                    // (`id NOT LIKE '%-%'`), and this id is a UUID, so without this the unsent note
+                    // would sit in "Previous Notes" forever and read as saved when it never reached
+                    // the server. Dropping it keeps the list honest; the composer keeps the text so
+                    // the agent can send again.
+                    noteDao.deleteNoteById(optimisticId)
+                    throw e
+                }
+
+                val serverNotes = updated.notes
+                if (serverNotes != null) {
+                    reconcileNotes(leadId, serverNotes)
+                } else {
+                    // The server saved the note but didn't send the list back. Pull it instead of
+                    // deleting the temporary row and leaving the agent with a note that "disappeared".
+                    runCatching { pullNotes(leadId) }
+                }
+                noteDao.deleteNoteById(optimisticId)
+            }
         }
     }.mapApiError()
 
@@ -1004,6 +1025,14 @@ class LeadsRepository @Inject constructor(
     }.mapApiError()
 
     suspend fun refreshLeadNotes(leadId: String): Result<Unit> = runCatching {
+        val token = session.getToken()?.takeIf { it.isNotBlank() }
+            ?: error("Not logged in — cannot refresh notes.")
+        val dto = leadsApi.getLead(id = leadId, authorization = token.toBearerOrNull())
+        reconcileNotes(leadId, dto.notes)
+    }
+
+    /** Fetches one lead's notes and replaces the stored server copy. Caller must hold [syncMutex]. */
+    private suspend fun pullNotes(leadId: String) {
         val token = session.getToken()?.takeIf { it.isNotBlank() }
             ?: error("Not logged in — cannot refresh notes.")
         val dto = leadsApi.getLead(id = leadId, authorization = token.toBearerOrNull())

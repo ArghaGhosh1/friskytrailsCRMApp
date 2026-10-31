@@ -403,6 +403,10 @@ fun LeadDetailScreen(
                             onEdit = { editingField = LeadEditField.NAME },
                         )
 
+                        lead.source?.let { source ->
+                            InfoRow("Source", source)
+                        }
+
                         lead.product?.let { product ->
                             InfoRow("Product", product)
                         }
@@ -451,6 +455,8 @@ fun LeadDetailScreen(
                             onEdit = { editingField = LeadEditField.PERSONS },
                         )
 
+                        InfoRow("Origin", detailState.origin.ifBlank { "—" })
+                        InfoRow("Destination", detailState.destination.ifBlank { "—" })
                         InfoRow("Total Dials", lead.totalDial.toString())
                         InfoRow("Connected", lead.connected.toString())
                         InfoRow("Talk Time", lead.talkTime.ifBlank { "—" })

@@ -27,6 +27,7 @@ import com.crmapplication.LeadDetailVM.repository.isBooked
 import com.crmapplication.LeadDetailVM.repository.callLabelFor
 import com.crmapplication.LeadDetailVM.repository.mergeLabels
 import com.crmapplication.LeadDetailVM.remote.CreateLeadRequest
+import com.crmapplication.LeadDetailVM.repository.AttendanceSnapshot
 import com.crmapplication.calllog.CallLogEntry
 import com.crmapplication.calllog.CallLogReader
 import com.crmapplication.calllog.normalizedPhoneKey
@@ -499,6 +500,7 @@ data class DashboardUiState(
     val data: DashboardData? = null,
     val needsPermission: Boolean = false,
     val error: String? = null,
+    val attendance: AttendanceSnapshot? = null
 )
 
 @HiltViewModel
@@ -516,6 +518,12 @@ class DashboardViewModel @Inject constructor(
     private var loadJob: Job? = null
 
     init {
+
+        _state.update { it.copy(attendance = repo.attendance.value) }
+        viewModelScope.launch {
+            repo.attendance.collect { a -> _state.update { it.copy(attendance = a) } }
+        }
+
         // Paint the last computed dashboard instantly if this VM was just recreated (nav re-entry).
         repo.lastData?.let { cached -> _state.update { it.copy(isLoading = false, data = cached) } }
         load()
@@ -1106,7 +1114,9 @@ data class LeadDetailUiState(
     val statusHistory: List<StatusChange> = emptyList(),
 
     val myAgentId: String? = null,
-    val agentName: String = ""
+    val agentName: String = "",
+    val origin: String = "",
+    val destination: String = "",
 )
 
 /**
@@ -1186,6 +1196,12 @@ class LeadDetailViewModel @Inject constructor(
         viewModelScope.launch {
             callLogSyncRepo.backfillCallsForLead(lead.phone, lead.id, lead.assignedAt)
         }
+
+        viewModelScope.launch {
+            repo.fetchLeadRoute(lead.id).onSuccess { (origin, destination) ->
+                _state.update { it.copy(origin = origin, destination = destination) }
+            }
+        }
     }
 
     /**
@@ -1247,6 +1263,12 @@ class LeadDetailViewModel @Inject constructor(
             lead?.let { repo.refreshLeadNotes(it.id) }
             lead?.phone?.let { refreshCallLogMatch(it) }
             if (showLoading) _state.update { it.copy(isLoading = false) }
+
+            lead?.let { l ->
+                repo.fetchLeadRoute(l.id).onSuccess { (origin, destination) ->
+                    _state.update { it.copy(origin = origin, destination = destination) }
+                }
+            }
         }
     }
 
