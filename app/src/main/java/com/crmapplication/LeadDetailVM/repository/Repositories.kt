@@ -84,6 +84,7 @@ import com.crmapplication.utils.formatTalkTimeWords
 import com.google.gson.Gson
 import com.google.gson.JsonObject
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import java.io.IOException
 import java.util.Calendar
 import kotlinx.coroutines.async
@@ -816,6 +817,7 @@ class LeadsRepository @Inject constructor(
      */
     override fun resetSessionState() {
         lastSyncAt = 0L
+        statusHoldUntil.clear()
     }
 
     fun currentAgentId(): String? = session.getAgentId()
@@ -826,6 +828,14 @@ class LeadsRepository @Inject constructor(
     // refresh / post-create pass force = true to bypass it. The mutex also folds concurrent callers
     // onto one in-flight request.
     private val syncMutex = Mutex()
+
+    /** Leads whose status save is in flight or just finished: a server snapshot taken meanwhile is stale. */
+    private val statusHoldUntil = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    private fun holdsLocalStatus(leadId: String): Boolean {
+        val until = statusHoldUntil[leadId] ?: return false
+        return until > System.currentTimeMillis()
+    }
     @Volatile private var lastSyncAt: Long = 0L
 
     fun observeLeads(): Flow<List<Lead>> = leadDao.getAllLeads().map { list ->
@@ -871,7 +881,10 @@ class LeadsRepository @Inject constructor(
         val entities = dtos.map { dto ->
             val entity = dto.toEntity()
             val prior = existing[entity.id]
-            val locallyChangedStatus = prior?.statusChangedAt != null
+// Keep the phone's status only while a save is in flight, or for a lead booked in this app
+// (Booked is final here, and a stale server value must not unlock it).
+            val keepLocalStatus = prior != null &&
+                    (holdsLocalStatus(entity.id) || prior.status.equals(BOOKED_STATUS, ignoreCase = true))
             entity.copy(
                 // Reminder precedence. `entity.dueDate` now carries the server's `dates.reminderDate`,
                 // so it wins when set — that's what makes a reminder set from the web dashboard show
@@ -883,8 +896,13 @@ class LeadsRepository @Inject constructor(
                 // got it". Preferring the local value loses a web-side clear (the agent can redo it)
                 // rather than a reminder the agent set on this device, which exists nowhere else.
                 dueDate = entity.dueDate ?: savedDueDates[entity.id] ?: prior?.dueDate,
-                statusChangedAt = prior?.statusChangedAt ?: entity.statusChangedAt,
-                status = if (locallyChangedStatus) prior!!.status else entity.status,
+                statusChangedAt = when {
+                    keepLocalStatus -> prior?.statusChangedAt
+                    prior != null && prior.status != entity.status ->
+                        entity.statusChangedAt ?: System.currentTimeMillis()      // changed elsewhere, e.g. on the website
+                    else -> prior?.statusChangedAt ?: entity.statusChangedAt
+                },
+                status = if (keepLocalStatus) prior!!.status else entity.status,
                 // Agent-editable fields (PUT api/leads/{id}), same precedence as dueDate above and
                 // for the same reason: the server wins when it actually sent a value, and a null is
                 // ambiguous between "cleared elsewhere" and "our push never landed" — so it must not
@@ -1208,9 +1226,39 @@ class LeadsRepository @Inject constructor(
     suspend fun updateStatus(leadId: String, status: String): Result<Unit> = runCatching {
         val now = System.currentTimeMillis()
 
-        val previousStatus = leadDao.getLeadById(leadId)?.status
+        // What to put back if the server doesn't accept the change.
+        val before = leadDao.getLeadById(leadId)
+        val previousStatus = before?.status
+        val previousChangedAt = before?.statusChangedAt
+
+        // From here until the server answers, a sync must not overwrite the phone's value.
+        statusHoldUntil[leadId] = Long.MAX_VALUE
+        // Optimistic: the list and detail screens repaint at once.
         leadDao.updateStatus(leadId, status, now)
 
+        try {
+            leadsApi.updateStatus(
+                id = leadId,
+                authorization = session.getToken()?.toBearerOrNull(),
+                body = UpdateStatusRequest(status),
+            )
+        } catch (e: Throwable) {
+            // Not saved: put the old status back so the screen never shows a change the server doesn't have.
+            // NonCancellable so the undo still runs if the screen was left while the request was failing.
+            withContext(NonCancellable) {
+                // Only if nothing newer has changed this lead in the meantime.
+                if (previousStatus != null && leadDao.getLeadById(leadId)?.status == status) {
+                    leadDao.restoreStatus(leadId, previousStatus, previousChangedAt)
+                }
+                statusHoldUntil.remove(leadId)
+            }
+            throw e
+        }
+
+        // Saved: keep the phone's value for a short while longer, then let the server's value win.
+        statusHoldUntil[leadId] = System.currentTimeMillis() + STATUS_HOLD_AFTER_PUSH_MS
+
+        // The history entry is written only now, so a change that didn't save never appears in it.
         if (previousStatus != status) {
             statusHistoryDao.insert(
                 StatusHistoryEntity(
@@ -1223,14 +1271,8 @@ class LeadsRepository @Inject constructor(
                 )
             )
         }
-        leadsApi.updateStatus(
-            id = leadId,
-            authorization = session.getToken()?.toBearerOrNull(),
-            body = UpdateStatusRequest(status),
-        )
         Unit
-    }
-
+    }.mapApiError()
     /**
      * Partial update of the agent-editable lead fields (`PUT api/leads/{id}`), offline-first like
      * [updateStatus]: Room is written first so the detail screen repaints immediately through
@@ -1413,6 +1455,8 @@ class LeadsRepository @Inject constructor(
     private companion object {
         /** Skip a network sync if the last one finished within this window (unless forced). */
         const val SYNC_THROTTLE_MS = 30_000L
+        /** How long after a successful status save a sync still keeps the phone's status. */
+        const val STATUS_HOLD_AFTER_PUSH_MS = 30_000L
 
         const val TAG = "LeadsRepo"
 

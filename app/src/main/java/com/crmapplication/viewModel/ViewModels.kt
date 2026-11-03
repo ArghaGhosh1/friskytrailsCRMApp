@@ -33,6 +33,7 @@ import com.crmapplication.calllog.CallLogReader
 import com.crmapplication.calllog.normalizedPhoneKey
 import com.crmapplication.notification.ReminderScheduler
 import com.crmapplication.utils.ThemeManager
+import com.crmapplication.utils.WhatsAppIntroStore
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.FlowPreview
@@ -712,6 +713,7 @@ data class LeadsUiState(
 
     /** One-shot: a lead-info edit was saved. UI shows the confirmation, then calls `clearLeadInfoSaved()`. */
     val leadInfoSaved: Boolean = false,
+    val statusSaved: Boolean = false,
 
     /**
      * The lead whose Booking Details form is open, or null when it's closed. Holding the [Lead] (not
@@ -975,11 +977,20 @@ class LeadsViewModel @Inject constructor(
             lead?.let { startBooking(it) }
             return
         }
+        val previous = _state.value.leads.find { it.id == leadId }?.status
 
         viewModelScope.launch {
-            repo.updateStatus(leadId, status).onFailure { e ->
-                _state.update { it.copy(error = e.message ?: "Could not update status") }
-            }
+            repo.updateStatus(leadId, status)
+                .onSuccess { _state.update { it.copy(statusSaved = true) } }
+                .onFailure { e ->
+                    val reason = e.message ?: "unknown error"
+                    _state.update {
+                        it.copy(
+                            error = if (previous != null) "Status not saved: $reason. Back to $previous."
+                            else "Status not saved: $reason"
+                        )
+                    }
+                }
         }
     }
 
@@ -1025,6 +1036,9 @@ class LeadsViewModel @Inject constructor(
     }
 
     fun clearLeadInfoSaved() = _state.update { it.copy(leadInfoSaved = false) }
+    fun clearStatusSaved() {
+        _state.update { it.copy(statusSaved = false) }
+    }
 
     /** Opens the Booking Details form for [lead]. No-op if it's already booked. */
     fun startBooking(lead: Lead) {
@@ -1146,7 +1160,8 @@ class LeadDetailViewModel @Inject constructor(
     private val callLogSyncRepo: CallLogSyncRepository,
     private val callLogReader: CallLogReader,
     private val reminderScheduler: ReminderScheduler,
-    private val authRepo: AuthRepository
+    private val authRepo: AuthRepository,
+    private val whatsAppIntro: WhatsAppIntroStore,
 ) : ViewModel() {
 
     private val _state = MutableStateFlow(LeadDetailUiState())
@@ -1164,6 +1179,13 @@ class LeadDetailViewModel @Inject constructor(
                 .collect { _state.value.lead?.phone?.let { refreshCallLogMatch(it) } }
         }
     }
+
+    /** True once this agent has opened WhatsApp with the greeting for this lead. */
+    fun whatsAppGreetingSent(leadId: String): Boolean =
+        whatsAppIntro.wasSent(repo.currentAgentId(), leadId)
+
+    fun markWhatsAppGreetingSent(leadId: String) =
+        whatsAppIntro.markSent(repo.currentAgentId(), leadId)
 
     fun loadLead(lead: Lead) {
         _state.update { it.copy(lead = lead, myAgentId = repo.currentAgentId() ,agentName = authRepo.getAgentName(), ) }

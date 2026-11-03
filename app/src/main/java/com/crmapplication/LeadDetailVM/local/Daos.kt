@@ -23,6 +23,9 @@ interface LeadDao {
     @Query("UPDATE leads SET status = :status, statusChangedAt = :changedAt WHERE id = :leadId")
     suspend fun updateStatus(leadId: String, status: String, changedAt: Long)
 
+    @Query("UPDATE leads SET status = :status, statusChangedAt = :changedAt WHERE id = :leadId")
+    suspend fun restoreStatus(leadId: String, status: String, changedAt: Long?)
+
     /**
      * Records what a confirmed booking was worth. Targeted for the same reason as [updateLeadInfo] —
      * a concurrent `syncLeads` must not clobber it with a row read before the booking landed.

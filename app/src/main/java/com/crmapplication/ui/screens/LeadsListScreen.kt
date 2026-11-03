@@ -37,6 +37,7 @@ import com.crmapplication.viewModel.LeadFilter
 import com.crmapplication.viewModel.LeadsUiState
 import com.crmapplication.viewModel.LeadsViewModel
 import com.crmapplication.viewModel.SortOrder
+import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -68,6 +69,20 @@ fun LeadsListScreen(
                 if (bookingId != null) bookedWithIdTemplate.format(bookingId) else bookedMessage
             )
             viewModel.clearBookingSuccess()
+        }
+    }
+
+    // Status changes come quickly on a list, so each message replaces the previous one instead of
+    // queueing behind it. The flag is cleared first and the message is shown from a separate scope,
+    // because clearing it restarts this effect, which would cancel a snackbar shown inside it.
+    val snackScope = rememberCoroutineScope()
+    LaunchedEffect(state.statusSaved) {
+        if (state.statusSaved) {
+            viewModel.clearStatusSaved()
+            snackScope.launch {
+                snackbarHostState.currentSnackbarData?.dismiss()
+                snackbarHostState.showSnackbar("Status updated!")
+            }
         }
     }
 
