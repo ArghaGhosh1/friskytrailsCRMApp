@@ -1264,24 +1264,14 @@ class LeadDetailViewModel @Inject constructor(
      * snackbar every interval. Errors the agent triggered (send note, upload) still surface.
      */
     fun refresh(showLoading: Boolean = true) {
-        val lead = _state.value.lead
+        val lead = _state.value.lead ?: return
         viewModelScope.launch {
             if (showLoading) _state.update { it.copy(isLoading = true) }
-            // force = true: the repository skips an unforced sync within 30s, which made resuming
-            // this screen inside that window a no-op and left backend-side changes invisible.
-            repo.syncLeads(force = true)
-            // syncLeads only reconciles notes when the leads payload embeds them, so ask for this
-            // lead's notes directly — otherwise a note added from the web shows up only after
-            // navigating away and back.
-            lead?.let { repo.refreshLeadNotes(it.id) }
-            lead?.phone?.let { refreshCallLogMatch(it) }
-            if (showLoading) _state.update { it.copy(isLoading = false) }
-
-            lead?.let { l ->
-                repo.fetchLeadRoute(l.id).onSuccess { (origin, destination) ->
-                    _state.update { it.copy(origin = origin, destination = destination) }
-                }
+            repo.refreshLead(lead.id).onSuccess { (origin, destination) ->
+                _state.update { it.copy(origin = origin, destination = destination) }
             }
+            refreshCallLogMatch(lead.phone)
+            if (showLoading) _state.update { it.copy(isLoading = false) }
         }
     }
 

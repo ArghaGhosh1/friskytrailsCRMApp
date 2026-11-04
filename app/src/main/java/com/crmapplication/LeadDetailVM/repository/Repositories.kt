@@ -537,6 +537,7 @@ class DashboardRepository @Inject constructor(
             .let { emit(it) }
 
         if (System.currentTimeMillis() - lastNetworkAt < NETWORK_THROTTLE_MS) return@flow
+        lastNetworkAt = System.currentTimeMillis()      // claim it now, not when the stage finishes
 
         // --- Stage 2: network (best effort, all at once) ---
         coroutineScope {
@@ -553,8 +554,8 @@ class DashboardRepository @Inject constructor(
             }
 
             val metrics = metricsDeferred.await()
-            val attendanceLogs = attendanceLogsDeferred.await()
             val monthlyAttendance = monthlyDeferred.await()
+            val attendanceLogs = if (monthlyAttendance == null) fetchAttendanceLogs() else emptyList()
             serverTodayDeferred.await()
 
             // Recompute with whatever the server held, then send the status if it has gone up.
@@ -719,7 +720,7 @@ class DashboardRepository @Inject constructor(
          * local stage is never throttled, so returning to the screen always recomputes today's call
          * figures from the device log.
          */
-        const val NETWORK_THROTTLE_MS = 10_000L
+        const val NETWORK_THROTTLE_MS = 120_000L
     }
 }
 
@@ -818,6 +819,7 @@ class LeadsRepository @Inject constructor(
     override fun resetSessionState() {
         lastSyncAt = 0L
         statusHoldUntil.clear()
+        lastPushed.clear()
     }
 
     fun currentAgentId(): String? = session.getAgentId()
@@ -828,6 +830,62 @@ class LeadsRepository @Inject constructor(
     // refresh / post-create pass force = true to bypass it. The mutex also folds concurrent callers
     // onto one in-flight request.
     private val syncMutex = Mutex()
+
+    /** What was last successfully sent per lead and kind, so an unchanged payload isn't sent again. */
+    private val lastPushed = java.util.concurrent.ConcurrentHashMap<String, Int>()
+    private val pushGson = Gson()
+
+    private suspend fun pushIfChanged(kind: String, leadId: String, body: Any, send: suspend () -> Unit) {
+        val key = "$kind:$leadId"
+        val fingerprint = pushGson.toJson(body).hashCode()
+        if (lastPushed[key] == fingerprint) return
+        send()
+        lastPushed[key] = fingerprint          // only after the server accepted it
+    }
+
+    @Volatile private var lastNoteSavedAt = 0L
+
+    /** One request for one lead: its row, its notes, and origin/destination. */
+    suspend fun refreshLead(leadId: String): Result<Pair<String, String>> = runCatching {
+        val startedAt = System.currentTimeMillis()
+        val token = session.getToken()?.takeIf { it.isNotBlank() } ?: error("Not logged in.")
+        val dto = leadsApi.getLead(id = leadId, authorization = token.toBearerOrNull())
+
+        leadDao.getLeadById(leadId)?.let { prior ->
+            leadDao.upsertLeads(listOf(mergeServerLead(dto, mapOf(prior.id to prior), dueDateStore.all())))
+        }
+        // Skip the notes this round if a note save or full sync is running or just finished; the next poll catches up.
+        if (startedAt >= lastNoteSavedAt && syncMutex.tryLock()) {
+            try { reconcileNotes(leadId, dto.notes) } finally { syncMutex.unlock() }
+        }
+        dto.origin.orEmpty().trim() to dto.destination.orEmpty().trim()
+    }.mapApiError()
+
+    private fun mergeServerLead(
+        dto: com.crmapplication.LeadDetailVM.remote.ApiLeadDto,
+        existing: Map<String, LeadEntity>,
+        savedDueDates: Map<String, Long>,
+    ): LeadEntity {
+        val entity = dto.toEntity()
+        val prior = existing[entity.id]
+        val keepLocalStatus = prior != null &&
+                (holdsLocalStatus(entity.id) || prior.status.equals(BOOKED_STATUS, ignoreCase = true))
+        return entity.copy(
+            dueDate = entity.dueDate ?: savedDueDates[entity.id] ?: prior?.dueDate,
+            statusChangedAt = when {
+                keepLocalStatus -> prior?.statusChangedAt
+                prior != null && prior.status != entity.status ->
+                    entity.statusChangedAt ?: System.currentTimeMillis()
+                else -> prior?.statusChangedAt ?: entity.statusChangedAt
+            },
+            status = if (keepLocalStatus) prior!!.status else entity.status,
+            travelDate = entity.travelDate ?: prior?.travelDate,
+            numberOfPersons = entity.numberOfPersons ?: prior?.numberOfPersons,
+            bookedAmount = prior?.bookedAmount,
+            bookedAt = prior?.bookedAt,
+            assignedAt = listOfNotNull(prior?.assignedAt, entity.createdAt).min(),
+        )
+    }
 
     /** Leads whose status save is in flight or just finished: a server snapshot taken meanwhile is stale. */
     private val statusHoldUntil = java.util.concurrent.ConcurrentHashMap<String, Long>()
@@ -878,68 +936,7 @@ class LeadsRepository @Inject constructor(
         // Durable due dates, read once. These outlive the `leads` table, so this is what puts a
         // saved reminder back after a destructive migration wiped the row it used to live in.
         val savedDueDates = dueDateStore.all()
-        val entities = dtos.map { dto ->
-            val entity = dto.toEntity()
-            val prior = existing[entity.id]
-// Keep the phone's status only while a save is in flight, or for a lead booked in this app
-// (Booked is final here, and a stale server value must not unlock it).
-            val keepLocalStatus = prior != null &&
-                    (holdsLocalStatus(entity.id) || prior.status.equals(BOOKED_STATUS, ignoreCase = true))
-            entity.copy(
-                // Reminder precedence. `entity.dueDate` now carries the server's `dates.reminderDate`,
-                // so it wins when set — that's what makes a reminder set from the web dashboard show
-                // up here. The store is the fallback and still the only copy that survives an app
-                // update (destructive migration); `prior` is the warm-path fallback.
-                //
-                // A *null* from the server deliberately does NOT clear a stored reminder: null is
-                // ambiguous between "cleared on the web" and "our push failed, so the server never
-                // got it". Preferring the local value loses a web-side clear (the agent can redo it)
-                // rather than a reminder the agent set on this device, which exists nowhere else.
-                dueDate = entity.dueDate ?: savedDueDates[entity.id] ?: prior?.dueDate,
-                statusChangedAt = when {
-                    keepLocalStatus -> prior?.statusChangedAt
-                    prior != null && prior.status != entity.status ->
-                        entity.statusChangedAt ?: System.currentTimeMillis()      // changed elsewhere, e.g. on the website
-                    else -> prior?.statusChangedAt ?: entity.statusChangedAt
-                },
-                status = if (keepLocalStatus) prior!!.status else entity.status,
-                // Agent-editable fields (PUT api/leads/{id}), same precedence as dueDate above and
-                // for the same reason: the server wins when it actually sent a value, and a null is
-                // ambiguous between "cleared elsewhere" and "our push never landed" — so it must not
-                // silently discard an edit the agent just made on this device.
-                //
-                // Without these two lines the detail screen's 25s poll rebuilt the row from the
-                // server response and wiped every edit within seconds of saving it.
-                travelDate = entity.travelDate ?: prior?.travelDate,
-                numberOfPersons = entity.numberOfPersons ?: prior?.numberOfPersons,
-                // Booking value: purely local, so `prior` is the ONLY source — there is no server
-                // field to fall back to and `dto.toEntity()` always leaves these null. Carried
-                // unconditionally rather than with the `entity.x ?: prior?.x` precedence used above,
-                // because an incoming null here means "the payload doesn't carry this", never
-                // "cleared". Omitting these two lines would zero the dashboard's monthly sale figure
-                // on the next refresh.
-                bookedAmount = prior?.bookedAmount,
-                bookedAt = prior?.bookedAt,
-                // Call-log cutoff: calls before this instant aren't this agent's work.
-                //
-                // Sourced from the server's `createdAt`, NOT from the moment this lead was first seen
-                // on this device. Room uses fallbackToDestructiveMigration(), so a first-sight stamp
-                // was re-set to "now" on every schema bump and every reinstall — which moved the
-                // cutoff forward and made the lead's entire call history disappear from the detail
-                // screen. `createdAt` comes from the payload, so it survives both.
-                //
-                // The backend exposes no assignment date (ApiLeadDto has createdAt/updatedAt only),
-                // so creation is the proxy. It can be earlier than the real assignment, which is
-                // harmless here: calls made before this agent held the lead were made by someone
-                // else on another device and so aren't in this device's call log at all.
-                //
-                // Takes the EARLIEST of stored and incoming, unlike the server-wins precedence used
-                // for the fields above. This cutoff may only ever move backwards — `createdAt`
-                // degrades to `now` when the server omits it (Models.kt `toEpochMillisOrNow`), and
-                // letting that overwrite an earlier stored stamp would hide history all over again.
-                assignedAt = listOfNotNull(prior?.assignedAt, entity.createdAt).min(),
-            )
-        }
+          val entities = dtos.map { dto -> mergeServerLead(dto, existing, savedDueDates) }
 
         if (entities.isEmpty()) leadDao.deleteAll()
         else leadDao.deleteLeadsNotIn(entities.map { it.id })
@@ -1025,6 +1022,7 @@ class LeadsRepository @Inject constructor(
                 }
                 noteDao.deleteNoteById(optimisticId)
             }
+            lastNoteSavedAt = System.currentTimeMillis()
         }
     }.mapApiError()
 
@@ -1411,25 +1409,17 @@ class LeadsRepository @Inject constructor(
     }.mapApiError()
 
     suspend fun updateBooking(leadId: String, calls: List<CallLogEntry>): Result<Unit> = runCatching {
-        // Lead-detail push: [calls] is already the post-assignment history (VM filters by assignedAt),
-        // so book the cumulative window — every dial since assignment, not just today's.
         val body = bookingFromCalls(calls, todayOnly = false) ?: return@runCatching
-        leadsApi.updateBooking(
-            id = leadId,
-            authorization = session.getToken()?.toBearerOrNull(),
-            body = body,
-        )
-        Unit
+        pushIfChanged("booking", leadId, body) {
+            leadsApi.updateBooking(id = leadId, authorization = session.getToken()?.toBearerOrNull(), body = body)
+        }
     }
 
     suspend fun updateDates(leadId: String, calls: List<CallLogEntry>): Result<Unit> = runCatching {
         val body = datesFromCalls(calls) ?: return@runCatching
-        leadsApi.updateDates(
-            id = leadId,
-            authorization = session.getToken()?.toBearerOrNull(),
-            body = body,
-        )
-        Unit
+        pushIfChanged("dates", leadId, body) {
+            leadsApi.updateDates(id = leadId, authorization = session.getToken()?.toBearerOrNull(), body = body)
+        }
     }
 
     suspend fun updateLabels(
@@ -1438,13 +1428,10 @@ class LeadsRepository @Inject constructor(
         calls: List<CallLogEntry>,
     ): Result<Unit> = runCatching {
         val callLabel = callLabelFor(calls) ?: return@runCatching
-        val merged = mergeLabels(existingLabels, callLabel)
-        leadsApi.updateLabels(
-            id = leadId,
-            authorization = session.getToken()?.toBearerOrNull(),
-            body = UpdateLabelsRequest(merged),
-        )
-        Unit
+        val body = UpdateLabelsRequest(mergeLabels(existingLabels, callLabel))
+        pushIfChanged("labels", leadId, body) {
+            leadsApi.updateLabels(id = leadId, authorization = session.getToken()?.toBearerOrNull(), body = body)
+        }
     }
 
     private fun String.toBearerOrNull(): String? {
@@ -1454,7 +1441,7 @@ class LeadsRepository @Inject constructor(
 
     private companion object {
         /** Skip a network sync if the last one finished within this window (unless forced). */
-        const val SYNC_THROTTLE_MS = 30_000L
+        const val SYNC_THROTTLE_MS = 180_000L
         /** How long after a successful status save a sync still keeps the phone's status. */
         const val STATUS_HOLD_AFTER_PUSH_MS = 30_000L
 
@@ -1540,7 +1527,7 @@ class ConfigRepository @Inject constructor(
     }
 
     private companion object {
-        const val CATALOG_THROTTLE_MS = 15_000L
+        const val CATALOG_THROTTLE_MS = 10 * 60_000L
     }
 }
 

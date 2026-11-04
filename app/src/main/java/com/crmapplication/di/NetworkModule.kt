@@ -10,6 +10,7 @@ import com.crmapplication.LeadDetailVM.remote.CloudinaryApi
 import com.crmapplication.LeadDetailVM.remote.ConfigApi
 import com.crmapplication.LeadDetailVM.remote.LeadsApi
 import com.crmapplication.LeadDetailVM.remote.UploadApi
+import com.crmapplication.utils.RequestMeterInterceptor
 import com.salescrm.BuildConfig
 import dagger.Module
 import dagger.Provides
@@ -98,6 +99,11 @@ object NetworkModule {
             .retryOnConnectionFailure(true)
             .addInterceptor(RetryIdempotentInterceptor(MAX_GET_RETRIES))
             .addInterceptor(logging)
+            .apply {
+                if (BuildConfig.DEBUG) {
+                    addInterceptor(RequestMeterInterceptor())
+                }
+            }
             .build()
     }
 
@@ -133,6 +139,11 @@ object NetworkModule {
             .writeTimeout(UPLOAD_WRITE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
             .retryOnConnectionFailure(false)
             .addInterceptor(logging)
+            .apply {
+                if (BuildConfig.DEBUG) {
+                    addInterceptor(RequestMeterInterceptor())
+                }
+            }
             .build()
     }
 

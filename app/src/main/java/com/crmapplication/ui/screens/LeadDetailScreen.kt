@@ -75,8 +75,7 @@ import java.text.SimpleDateFormat
 import java.util.*
 
 /** How often to re-pull this lead while the screen is in front of the agent. */
-private const val DETAIL_POLL_INTERVAL_MS = 25_000L
-
+private const val DETAIL_POLL_INTERVAL_MS = 90_000L
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun LeadDetailScreen(
@@ -132,10 +131,7 @@ fun LeadDetailScreen(
         if (!isResumed) return@LaunchedEffect
         while (true) {
             delay(DETAIL_POLL_INTERVAL_MS)
-            detailVm.refresh(showLoading = false)
-            // Same reason as ON_RESUME: a status added on the backend should reach this screen's
-            // dropdown while the agent is sitting on it. Throttled in the repository.
-            leadsVm.refreshConfig()
+            detailVm.refresh(showLoading = false)      // no refreshConfig() here any more
         }
     }
 

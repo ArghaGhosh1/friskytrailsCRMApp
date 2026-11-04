@@ -10,7 +10,9 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import com.crmapplication.ui.CrmNavGraph
 import com.crmapplication.ui.theme.CRMApplicationTheme
+import com.crmapplication.utils.RequestMeter
 import com.crmapplication.utils.ThemeManager
+import com.salescrm.BuildConfig
 import dagger.hilt.android.AndroidEntryPoint
 import dagger.hilt.android.HiltAndroidApp
 import kotlinx.coroutines.flow.first
@@ -18,8 +20,16 @@ import kotlinx.coroutines.runBlocking
 import javax.inject.Inject
 
 @HiltAndroidApp
-class CrmApplication : Application()
+class CrmApplication : Application() {
 
+    override fun onCreate() {
+        super.onCreate()
+
+        if (BuildConfig.DEBUG) {
+            RequestMeter.init(this)
+        }
+    }
+}
 @AndroidEntryPoint
 class MainActivity : ComponentActivity() {
 
